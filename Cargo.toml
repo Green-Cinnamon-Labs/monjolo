@@ -1,0 +1,17 @@
+# Framework de simulação genérico — não sabe nada de TEP, química ou qualquer
+# planta específica. Só sabe de DynamicModel, composição, integração numérica
+# e os blocos genéricos (atuador/sensor de 1ª ordem, distúrbio cúbico) que
+# qualquer planta simulada pode reaproveitar.
+
+[package]
+name = "simulation_framework"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "simulation_framework"
+path = "src/lib.rs"
+
+[dependencies]
+rand = { version = "0.8", features = ["small_rng"] }
+rand_distr = "0.4"
