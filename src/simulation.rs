@@ -12,6 +12,12 @@
 // chama não precisa saber que StateRegistry existe: só passa "como construir
 // o modelo" e recebe de volta uma Simulation pronta pra rodar.
 //
+// Simulation é também o objeto que mantém sensores/atuadores registrados
+// (seção 10 do plano) — dono de uma `IoImage`. Um adaptador externo (ex.: o
+// servidor OPC-UA em tep-opcuaServer) chama `add_sensor`/`add_actuator` uma
+// vez, na montagem, e depois só usa `io()` pra listar/ler/escrever sinais a
+// cada tick, sem tocar em StateRegistry/DynamicModel diretamente.
+//
 // EM TRANSIÇÃO: falta o Integrator de verdade (RK4 ainda está comentado, com
 // assinatura antiga) — `run()` por enquanto só faz uma rodada de avaliação e
 // commita, sem integrar nada no tempo.
@@ -20,11 +26,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::dynamic_model::DynamicModel;
+use crate::io_image::{CommandSink, IoImage};
+use crate::sensor::model::{Sensor, SensorBehavior};
 use crate::state_registry::StateRegistry;
 
 pub struct Simulation {
     model: Box<dyn DynamicModel>,
     registry: Rc<RefCell<StateRegistry>>,
+    io: IoImage,
 }
 
 impl Simulation {
@@ -35,7 +44,34 @@ impl Simulation {
         let registry = StateRegistry::shared();
         let model: Box<dyn DynamicModel> = Box::new(build(&mut registry.borrow_mut()));
         registry.borrow_mut().resolve()?;
-        Ok(Self { model, registry })
+        Ok(Self { model, registry, io: IoImage::new() })
+    }
+
+    /** Publica um `Sensor` observando `key`, sob o nome `name`, na `IoImage`
+    desta simulação. Só chame depois que `new()` retornar — `resolve()` já
+    rodou nesse ponto (seção 3.8 do plano), então `key` precisa já existir.
+    */
+    pub fn add_sensor(
+        &mut self,
+        name: &str,
+        key: &str,
+        behavior: Box<dyn SensorBehavior>,
+    ) -> Result<(), String> {
+        let sensor = Sensor::new(self.registry.clone(), key, behavior)?;
+        self.io.publish_sensor(name, sensor);
+        Ok(())
+    }
+
+    /// Registra um sink de comando sob `name` na `IoImage` desta simulação.
+    pub fn add_actuator(&mut self, name: &str, sink: impl CommandSink + 'static) {
+        self.io.register_actuator(name, sink);
+    }
+
+    /// Acesso à `IoImage` — um adaptador externo (ex.: servidor OPC-UA) usa
+    /// isso pra listar/ler/escrever sinais, tipicamente depois de cada
+    /// `run()`.
+    pub fn io(&mut self) -> &mut IoImage {
+        &mut self.io
     }
 
     /// TODO: isso ainda não é um loop de integração de verdade — falta o
