@@ -1,18 +1,18 @@
 // io_image.rs
-//
-// Fronteira externa mínima do simulation-framework (ver
-// docs/issue55_opcua_refactor/plan_refactor.md, seção 10): o lugar único
-// onde Sensores publicam valores e Atuadores recebem comandos, por nome
-// semântico — análogo a uma imagem de I/O/tabela de tags/registradores
-// numa planta real.
-//
-// Não sabe nada de DynamicModel, RK4, StateRegistry ou avaliação hipotética
-// — só embrulha `Sensor` (leitura) e um sink de comando genérico (escrita)
-// atrás de um catálogo nomeado. É a interface que um adaptador futuro
-// (OPC-UA, Modbus/register-map, HTTP/gRPC, WebSocket...) vai consumir;
-// nenhum desses existe ainda — hoje só existe este adaptador interno, em
-// memória, tosco de propósito.
 
+/** Fronteira externa mínima do simulation-framework (ver
+ docs/issue55_opcua_refactor/plan_refactor.md, seção 10): o lugar único
+ onde Sensores publicam valores e Atuadores recebem comandos, por nome
+ semântico — análogo a uma imagem de I/O/tabela de tags/registradores
+ numa planta real.
+
+ Não sabe nada de DynamicModel, RK4, StateRegistry ou avaliação hipotética
+ — só embrulha `Sensor` (leitura) e um sink de comando genérico (escrita)
+ atrás de um catálogo nomeado. É a interface que um adaptador futuro
+ (OPC-UA, Modbus/register-map, HTTP/gRPC, WebSocket...) vai consumir;
+ nenhum desses existe ainda — hoje só existe este adaptador interno, em
+ memória, tosco de propósito.
+*/
 use std::collections::HashMap;
 
 use crate::sensor::model::Sensor;
@@ -33,6 +33,18 @@ impl<F: FnMut(f64)> CommandSink for F {
     }
 }
 
+/** Deixa um `Box<dyn CommandSink + Send>` já resolvido (ex.: a especificação
+guardada por `Simulation` antes de `run_model()`) ser aceito onde
+`register_actuator` espera `impl CommandSink` — só encaminha pro sink de
+dentro. Fica double-boxed (`Box<Box<dyn CommandSink + Send>>` por trás),
+aceitável porque escrita de atuador não é caminho quente.
+*/
+impl CommandSink for Box<dyn CommandSink + Send> {
+    fn write(&mut self, value: f64) {
+        (**self).write(value)
+    }
+}
+
 /** Catálogo central de sinais — a I/O Image. Sensores entram como sinais de
 leitura (convenção: `sensors/<nome>`), atuadores como sinais de escrita
 (convenção: `actuators/<nome>`) — o prefixo é só convenção do chamador, não
@@ -50,12 +62,12 @@ impl IoImage {
         Self::default()
     }
 
-    /** Publica um `Sensor` já construído sob um nome. Não constrói o Sensor
+    /** Registra um `Sensor` já construído sob um nome. Não constrói o Sensor
     aqui — quem já resolveu a chave contra o `StateRegistry` (seção 3.8 do
     plano) entrega o `Sensor` pronto; `IoImage` não sabe nada de
     `StateRegistry`/`ReadProxy`.
     */
-    pub fn publish_sensor(&mut self, name: &str, sensor: Sensor) {
+    pub fn register_sensor(&mut self, name: &str, sensor: Sensor) {
         self.readable.insert(name.to_string(), sensor);
     }
 
@@ -117,7 +129,7 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
-    fn publishes_sensor_and_exposes_read() {
+    fn registers_sensor_and_exposes_read() {
         let registry = StateRegistry::shared();
         let (offered, _) = registry
             .borrow_mut()
@@ -128,7 +140,7 @@ mod tests {
 
         let sensor = Sensor::new(registry, "reactor.temperature", Box::new(Ideal)).unwrap();
         let mut io = IoImage::new();
-        io.publish_sensor("sensors/reactor.temperature", sensor);
+        io.register_sensor("sensors/reactor.temperature", sensor);
 
         assert_eq!(io.read("sensors/reactor.temperature"), Some(120.5));
         assert_eq!(io.read("sensors/does.not.exist"), None);
@@ -160,7 +172,7 @@ mod tests {
 
         let sensor = Sensor::new(registry, "reactor.temperature", Box::new(Ideal)).unwrap();
         let mut io = IoImage::new();
-        io.publish_sensor("sensors/reactor.temperature", sensor);
+        io.register_sensor("sensors/reactor.temperature", sensor);
         io.register_actuator("actuators/cooling_water.command", |_v| {});
 
         let mut signals = io.signals();

@@ -19,6 +19,23 @@ pub trait DynamicModel {
     fn name(&self) -> &'static str { "unnamed" }
 
     fn evaluate(&self);
+
+    /** Sinais que esse modelo declara como observáveis — pares (nome de
+    exposição, chave do `StateRegistry`). Vazio por padrão: a maioria dos
+    `DynamicModel` (folhas como `Reactor`/`Valve`) não declara nada, só quem
+    orquestra (ex.: `TennesseeEastmanModel`) sabe quais dos seus próprios
+    slots fazem sentido expor pra fora — a mesma relação que `add_dynamic`
+    tem com composição, `sensors` tem com observabilidade (drawio,
+    aba "arquitetura": "TennesseeEastmanModel --DECLARA--> Sensor").
+
+    Chamado por `Simulation::set_model()` uma única vez, com o modelo ainda
+    no tipo concreto (antes de virar `Box<dyn DynamicModel>`) — por isso o
+    `Simulation` nem precisa desse método pra tipos que não o sobrescrevem,
+    o default vazio já resolve.
+    */
+    fn sensors(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /**Contrato de Composição: CompositeDynamicModel estende DynamicModel

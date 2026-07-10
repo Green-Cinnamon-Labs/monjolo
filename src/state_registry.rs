@@ -172,12 +172,13 @@ impl StateRegistry {
         Rc::new(RefCell::new(Self::new()))
     }
 
-    /// Um DynamicModel se inscreve: `offers` são os nomes dos slots que ele
-    /// próprio provê (reservados e resolvidos na hora — a posição já é
-    /// conhecida no momento em que a posição é criada); `needs` são as chaves
-    /// de outros componentes que ele vai ler (devolvidas como Proxy NÃO
-    /// resolvido — só ganham posição real em resolve()). Não importa a ordem
-    /// de inscrição entre quem oferece e quem pede.
+    /** [REVISADO] | Um DynamicModel se inscreve: `offers` são os nomes dos slots que ele
+    próprio provê (reservados e resolvidos na hora — a posição já é
+    conhecida no momento em que a posição é criada); `needs` são as chaves
+    de outros componentes que ele vai ler (devolvidas como Proxy NÃO
+    resolvido — só ganham posição real em resolve()). Não importa a ordem
+    de inscrição entre quem oferece e quem pede.
+    */
     pub fn subscribe(&mut self, offers: &[&str], needs: &[&str]) -> (Vec<Proxy>, Vec<Proxy>) {
         let offered = offers
             .iter()
@@ -241,7 +242,10 @@ impl StateRegistry {
     */
     pub fn read_proxy(&self, key: &str) -> Option<ReadProxy> {
         let idx = *self.index.get(key)?;
-        Some(ReadProxy { buffer: self.current_state.clone(), index: idx })
+        Some(ReadProxy {
+            buffer: self.current_state.clone(),
+            index: idx,
+        })
     }
 
     /** Foto nomeada do CurrentState — reconstrói `Vec<StateSlot>` sob
@@ -253,7 +257,10 @@ impl StateRegistry {
     pub fn snapshot(&self) -> Vec<StateSlot> {
         let cur = self.current_state.borrow();
         let mut slots: Vec<StateSlot> = (0..cur.len())
-            .map(|_| StateSlot { key: String::new(), value: 0.0 })
+            .map(|_| StateSlot {
+                key: String::new(),
+                value: 0.0,
+            })
             .collect();
         for (key, &idx) in &self.index {
             if let Some(slot) = slots.get_mut(idx) {

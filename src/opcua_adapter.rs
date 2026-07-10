@@ -1,28 +1,27 @@
 // opcua_adapter.rs
 //
 // Adaptador OPC-UA genérico (ver docs/issue55_opcua_refactor/plan_refactor.md,
-// seção 10): expõe a IoImage de uma Simulation via um servidor OPC-UA
-// mínimo. Não sabe nada de TEP/química/planta específica — só enxerga os
-// nomes de sinais que quem montou a Simulation já declarou via
-// `Simulation::add_sensor`/`add_actuator`. A fronteira é: o framework expõe;
-// quem monta a Simulation decide o que existe e como se chama.
+// seção 10): expõe sensores/atuadores via um servidor OPC-UA mínimo. Não
+// sabe nada de TEP/química/planta específica, nem de `Simulation`/
+// `StateRegistry`/`IoImage` — só recebe nomes (`sensor_names`/
+// `actuator_names`) e as duas pontes thread-safe que a "Thread da planta"
+// já publica/consome (`SnapshotBus`/`CommandQueue`, ver
+// drawio/dynamicModel.drawio, aba "arquitetura"). Quem chama essa função é
+// `Simulation::run_model()`, nunca o usuário do framework direto.
 //
 // Requer a feature `opcua` — puxa async-opcua + tokio, pesados demais pra
 // serem dependência default do resto do crate.
 //
 // Sensores viram nodes read-only, atualizados por push (`set_values`) a
-// cada tick — nunca por `add_read_callback`, porque callbacks de leitura
-// seriam chamados pela árvore de conexão do servidor, e nada aqui precisa
-// disso: o valor já está pronto depois de cada `Simulation::run()`.
+// cada tick, lendo do `SnapshotBus` — nunca por `add_read_callback`, porque
+// o valor já está publicado, não precisa ser computado sob demanda.
 //
 // Atuadores viram nodes writable com um `add_write_callback` de verdade —
-// mas esse callback é `Send + Sync` (exigência do SimpleNodeManager) e
-// `Simulation`/`IoImage` não são (guardam `Rc<RefCell<StateRegistry>>`,
-// deliberadamente single-thread — plan_refactor.md, seção 3.9). Por isso o
-// callback não toca em `Simulation` direto: só empurra `(nome, valor)` num
-// canal (`tokio::sync::mpsc`, cujo `Sender` É Send/Sync). O lado de cá do
-// canal é drenado no mesmo loop que chama `Simulation::run()`, aplicando os
-// comandos via `simulation.io().write(...)` antes do próximo passo.
+// esse callback é `Fn(...) + Send + Sync + 'static` (exigência do
+// SimpleNodeManager) e só toca o `CommandQueue` (que é Send+Sync de
+// verdade, ao contrário do que tínhamos antes com `Simulation`/`IoImage`
+// direto) — sem LocalSet/spawn_local, sem runtime current_thread: nada
+// aqui é !Send, então roda no runtime tokio padrão.
 
 use std::time::Duration;
 
@@ -32,24 +31,29 @@ use opcua::server::diagnostics::NamespaceMetadata;
 use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
 use opcua::server::ServerBuilder;
 use opcua::types::{DataValue, MessageSecurityMode, NodeId, NumericRange, StatusCode};
-use tokio::sync::mpsc;
 
-use crate::simulation::Simulation;
+use crate::command_queue::CommandQueue;
+use crate::snapshot_bus::SnapshotBus;
 
 const NAMESPACE_URI: &str = "urn:simulation-framework:opcua-adapter";
 
-/** Sobe um servidor OPC-UA expondo todos os sinais já declarados na
-`IoImage` da `simulation` recebida: um node read-only por
-`io.sensor_names()`, um node writable por `io.actuator_names()`.
+/** Sobe um servidor OPC-UA: um node read-only por nome em `sensor_names`
+(lido de `snapshot` a cada tick), um node writable por nome em
+`actuator_names` (escrita empurrada em `commands`).
 
 `endpoint` no formato `opc.tcp://<host>:<porta><path>`, ex.:
 `"opc.tcp://0.0.0.0:4840/tep/server/"`.
 
 Bloqueia até o servidor encerrar (erro fatal — não há shutdown gracioso
-ainda). Move `simulation` pra dentro: dono exclusivo do loop de tick daqui
-em diante.
+ainda).
 */
-pub async fn serve(mut simulation: Simulation, endpoint: &str) -> Result<(), String> {
+pub async fn serve(
+    sensor_names: Vec<String>,
+    actuator_names: Vec<String>,
+    snapshot: SnapshotBus,
+    commands: CommandQueue,
+    endpoint: &str,
+) -> Result<(), String> {
     let (host, port, path) = parse_endpoint(endpoint)?;
 
     let (server, handle) = ServerBuilder::new()
@@ -86,26 +90,12 @@ pub async fn serve(mut simulation: Simulation, endpoint: &str) -> Result<(), Str
         .get_namespace_index(NAMESPACE_URI)
         .ok_or_else(|| "namespace não registrado".to_string())?;
 
-    let sensor_names: Vec<String> = simulation.io().sensor_names().map(str::to_owned).collect();
-    let actuator_names: Vec<String> = simulation
-        .io()
-        .actuator_names()
-        .map(str::to_owned)
-        .collect();
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<(String, f64)>();
-
     let sensor_nodes: Vec<(NodeId, String)> = {
         let address_space = node_manager.address_space();
         let mut address_space = address_space.write();
 
         let folder_id = NodeId::new(ns, "signals");
-        address_space.add_folder(
-            &folder_id,
-            "Signals",
-            "Signals",
-            &NodeId::objects_folder_id(),
-        );
+        address_space.add_folder(&folder_id, "Signals", "Signals", &NodeId::objects_folder_id());
 
         let sensor_nodes: Vec<(NodeId, String)> = sensor_names
             .into_iter()
@@ -125,7 +115,7 @@ pub async fn serve(mut simulation: Simulation, endpoint: &str) -> Result<(), Str
             var.set_writable(true);
             let _ = address_space.add_variables(vec![var], &folder_id);
 
-            let tx = tx.clone();
+            let commands = commands.clone();
             let cb_name = name.clone();
             node_manager.inner().add_write_callback(
                 node_id,
@@ -135,7 +125,7 @@ pub async fn serve(mut simulation: Simulation, endpoint: &str) -> Result<(), Str
                     .and_then(|v| v.as_f64())
                 {
                     Some(value) => {
-                        let _ = tx.send((cb_name.clone(), value));
+                        commands.write(&cb_name, value);
                         StatusCode::Good
                     }
                     None => StatusCode::BadTypeMismatch,
@@ -148,36 +138,24 @@ pub async fn serve(mut simulation: Simulation, endpoint: &str) -> Result<(), Str
 
     let subscriptions = handle.subscriptions().clone();
 
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async move {
-            tokio::task::spawn_local(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(500));
-                loop {
-                    interval.tick().await;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            interval.tick().await;
 
-                    while let Ok((name, value)) = rx.try_recv() {
-                        let _ = simulation.io().write(&name, value);
-                    }
+            let updates: Vec<_> = sensor_nodes
+                .iter()
+                .map(|(node_id, name)| {
+                    let value = snapshot.read(name).unwrap_or(f64::NAN);
+                    (node_id, None, DataValue::new_now(value))
+                })
+                .collect();
 
-                    simulation.run();
+            let _ = node_manager.set_values(&subscriptions, updates.into_iter());
+        }
+    });
 
-                    let updates: Vec<_> = sensor_nodes
-                        .iter()
-                        .map(|(node_id, name)| {
-                            let value = simulation.io().read(name).unwrap_or(f64::NAN);
-                            (node_id, None, DataValue::new_now(value))
-                        })
-                        .collect();
-
-                    let _ = node_manager.set_values(&subscriptions, updates.into_iter());
-                }
-            });
-
-            server.run().await
-        })
-        .await
-        .map_err(|e| format!("servidor OPC-UA encerrou com erro: {e}"))
+    server.run().await.map_err(|e| format!("servidor OPC-UA encerrou com erro: {e}"))
 }
 
 fn parse_endpoint(endpoint: &str) -> Result<(String, u16, String), String> {
@@ -189,8 +167,6 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, u16, String), String> {
     let (host, port) = authority
         .split_once(':')
         .ok_or_else(|| format!("endpoint '{endpoint}' precisa de host:porta"))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| format!("porta inválida em '{endpoint}'"))?;
+    let port: u16 = port.parse().map_err(|_| format!("porta inválida em '{endpoint}'"))?;
     Ok((host.to_string(), port, path))
 }
