@@ -34,7 +34,7 @@ impl<F: FnMut(f64)> CommandSink for F {
 }
 
 /** Deixa um `Box<dyn CommandSink + Send>` já resolvido (ex.: a especificação
-guardada por `Simulation` antes de `run_model()`) ser aceito onde
+guardada por `Simulation` antes de `run()`) ser aceito onde
 `register_actuator` espera `impl CommandSink` — só encaminha pro sink de
 dentro. Fica double-boxed (`Box<Box<dyn CommandSink + Send>>` por trás),
 aceitável porque escrita de atuador não é caminho quente.

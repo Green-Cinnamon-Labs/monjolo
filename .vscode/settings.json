@@ -1,0 +1,7 @@
+{
+    "editor.wordWrap": "off",
+    "editor.rulers": [],
+    "[rust]": {
+        "editor.formatOnSave": false
+    }
+}

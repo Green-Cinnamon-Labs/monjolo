@@ -114,26 +114,26 @@ impl ReadProxy {
 }
 
 pub struct StateRegistry {
-    /// Buffer estável do estado confirmado (CurrentState, seção 1.3 do
-    /// plano) — mesma forma de `evaluation_state`: `Rc<RefCell<Vec<Cell<f64>>>>`,
-    /// mutado célula-a-célula por `commit()`, nunca substituído por inteiro.
-    /// É sobre este buffer que `ReadProxy` resolve, uma vez, a posição que
-    /// vai ler pra sempre. Sem nome embutido — nome é só em `index`; ver
-    /// `snapshot()` pra reconstrução nomeada sob demanda.
+    /** Buffer estável do estado confirmado (CurrentState, seção 1.3 do
+    plano) — mesma forma de `evaluation_state`: `Rc<RefCell<Vec<Cell<f64>>>>`,
+    mutado célula-a-célula por `commit()`, nunca substituído por inteiro.
+    É sobre este buffer que `ReadProxy` resolve, uma vez, a posição que
+    vai ler pra sempre. Sem nome embutido — nome é só em `index`; ver
+    `snapshot()` pra reconstrução nomeada sob demanda.
+    */
     current_state: Rc<RefCell<Vec<Cell<f64>>>>,
 
-    /// Buffer de trabalho de uma rodada de avaliação (seção 8 do plano).
-    /// Compartilhado com todo `Proxy` já emitido — por isso `Rc<RefCell<_>>`
-    /// (a lista cresce durante subscribe(), então precisa de mutabilidade;
-    /// `Cell` por elemento é o que permite `evaluate()` escrever com `&self`).
+    /** Buffer de trabalho de uma rodada de avaliação (seção 8 do plano).
+     Compartilhado com todo `Proxy` já emitido — por isso `Rc<RefCell<_>>`
+     (a lista cresce durante subscribe(), então precisa de mutabilidade;
+     `Cell` por elemento é o que permite `evaluate()` escrever com `&self`).
+    */
     evaluation_state: Rc<RefCell<Vec<Cell<f64>>>>,
 
-    /// nome semântico -> posição em `evaluation_state`, preenchido conforme
-    /// os outputs vão sendo oferecidos em subscribe().
+    /// nome semântico -> posição em `evaluation_state`, preenchido conforme os outputs vão sendo oferecidos em subscribe().
     index: HashMap<String, usize>,
 
-    /// Inputs declarados em subscribe(), ainda não resolvidos. resolve()
-    /// esvazia essa lista, escrevendo a posição real em cada Proxy.
+    /// Inputs declarados em subscribe(), ainda não resolvidos. resolve() esvazia essa lista, escrevendo a posição real em cada Proxy.
     pending_requests: Vec<(String, Proxy)>,
 }
 
@@ -147,12 +147,13 @@ impl StateRegistry {
         }
     }
 
-    /// Garante que `current_state` tenha, no mínimo, o tamanho de
-    /// `evaluation_state` — só cresce, nunca encolhe (mesma invariante
-    /// append-only da seção 5.2 do plano). Chamado em `resolve()` (pra
-    /// `ReadProxy` já nascer endereçando uma posição válida, mesmo antes do
-    /// primeiro `commit()`) e em `commit()` (defensivo, custo ~zero depois
-    /// da primeira vez).
+    /** Garante que `current_state` tenha, no mínimo, o tamanho de
+     `evaluation_state` — só cresce, nunca encolhe (mesma invariante
+     append-only da seção 5.2 do plano). Chamado em `resolve()` (pra
+     `ReadProxy` já nascer endereçando uma posição válida, mesmo antes do
+     primeiro `commit()`) e em `commit()` (defensivo, custo ~zero depois
+     da primeira vez).
+    */
     fn ensure_current_capacity(&self) {
         let len = self.evaluation_state.borrow().len();
         let mut cur = self.current_state.borrow_mut();
@@ -286,40 +287,3 @@ impl StateRegistry {
     }
 }
 
-/** Handle somente-leitura sobre um `StateRegistry` compartilhado — usado por
-consumidores que só observam `CurrentState` e nunca deveriam poder chamar
-`subscribe()`/`resolve()`/`commit()` (ex.: `Sensor`, plan_refactor.md seção
-3.6). Guarda o mesmo `Rc<RefCell<StateRegistry>>` usado no resto do sistema,
-mas só expõe leitura — a garantia de "só lê" vem do tipo, não de disciplina
-de quem usa. Além de leitura pontual por chave, funciona como fábrica de
-`ReadProxy` (seção 3.6.3 do plano): `Sensor` chama `read_proxy()` uma vez, na
-construção, e nunca mais precisa de `RegistryView`/lookup por string depois
-disso.
-*/
-#[derive(Clone)]
-pub struct RegistryView(Rc<RefCell<StateRegistry>>);
-
-impl RegistryView {
-    pub fn new(registry: Rc<RefCell<StateRegistry>>) -> Self {
-        Self(registry)
-    }
-
-    /// Leitura pontual por chave — debug/inspeção avulsa. Não é o caminho
-    /// quente; ver `read_proxy()`.
-    pub fn read(&self, key: &str) -> Option<f64> {
-        self.0.borrow().read(key)
-    }
-
-    /// Fábrica de `ReadProxy`: resolve a chave uma vez contra `CurrentState`.
-    /// Chamar só depois que todo `DynamicModel` já se inscreveu e
-    /// `StateRegistry::resolve()` geral já rodou.
-    pub fn read_proxy(&self, key: &str) -> Option<ReadProxy> {
-        self.0.borrow().read_proxy(key)
-    }
-
-    /// Foto nomeada do CurrentState — debug/listagem/exportação, não o
-    /// caminho quente de leitura.
-    pub fn snapshot(&self) -> Vec<StateSlot> {
-        self.0.borrow().snapshot()
-    }
-}

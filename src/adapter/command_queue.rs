@@ -1,4 +1,4 @@
-// command_queue.rs
+// src/adapter/command_queue.rs
 //
 // Ponte thread-safe de ESCRITA, sentido oposto ao SnapshotBus — ver
 // drawio/dynamicModel.drawio, aba "arquitetura", nó "Command Queue".
@@ -25,7 +25,9 @@ pub struct CommandQueue {
 
 impl CommandQueue {
     pub fn new(sender: Sender<(String, f64)>) -> Self {
-        Self { sender: Arc::new(Mutex::new(sender)) }
+        Self {
+            sender: Arc::new(Mutex::new(sender)),
+        }
     }
 
     /// Enfileira um comando — não bloqueia esperando a planta processar.

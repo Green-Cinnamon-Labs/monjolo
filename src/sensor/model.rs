@@ -17,7 +17,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 
-use crate::state_registry::{ReadProxy, RegistryView, StateRegistry};
+use crate::state_registry::{ReadProxy, StateRegistry};
 
 /** O que acontece entre o valor bruto lido do registry e o valor devolvido
 pelo sensor. Pode ter estado interno (ex.: última leitura, para
@@ -56,7 +56,7 @@ impl Sensor {
         key: &str,
         behavior: Box<dyn SensorBehavior>,
     ) -> Result<Self, String> {
-        let proxy = RegistryView::new(registry).read_proxy(key).ok_or_else(|| format!(
+        let proxy = registry.borrow().read_proxy(key).ok_or_else(|| format!(
             "Sensor: chave '{key}' não existe em CurrentState — StateRegistry::resolve() já rodou e nenhum componente oferece esse slot?"
         ))?;
         Ok(Self { proxy, behavior })

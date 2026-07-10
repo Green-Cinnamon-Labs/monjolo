@@ -6,7 +6,7 @@
  os primeiros com uma derivada REAL (não um TODO): `evaluate()` calcula
  `(command - position) / tau` e escreve tanto o valor lido de volta quanto
  a derivada, ambos via Proxy.
- 
+
  Cada instância precisa de um `name` único (ex.: "feed_a", "agitator") pra
  não colidir no StateRegistry — há várias válvulas na planta (XMV-01..11).
 */
@@ -68,10 +68,8 @@ pub struct Agitator {
 
 impl Agitator {
     pub fn new(registry: &mut StateRegistry, tau: f64) -> Self {
-        let (offered, _) = registry.subscribe(
-            &["agitator.speed", "agitator.speed.derivative"],
-            &[],
-        );
+        let (offered, _) =
+            registry.subscribe(&["agitator.speed", "agitator.speed.derivative"], &[]);
 
         Self {
             tau,

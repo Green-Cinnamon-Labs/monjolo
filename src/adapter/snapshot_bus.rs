@@ -1,4 +1,4 @@
-// snapshot_bus.rs
+// src/adapter/snapshot_bus.rs
 //
 // Ponte thread-safe de LEITURA entre a "Thread da planta" e qualquer
 // consumidor externo (ex.: a "Thread do OPC-UA") — ver
@@ -6,7 +6,7 @@
 //
 // A planta publica o valor de cada sensor aqui a cada tick (`publish`);
 // quem está do outro lado só lê (`read`) — nunca escreve. Só `std`, sem
-// tokio: `Simulation::run_model()` usa isso incondicionalmente (mesmo sem a
+// tokio: `Simulation::run()` usa isso incondicionalmente (mesmo sem a
 // feature `opcua`), então não pode depender de nada opcional.
 
 use std::collections::HashMap;

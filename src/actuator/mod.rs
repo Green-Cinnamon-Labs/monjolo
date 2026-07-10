@@ -1,2 +1,2 @@
-pub mod model;
 pub mod dynamic;
+pub mod model;

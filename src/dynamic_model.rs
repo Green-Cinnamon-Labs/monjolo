@@ -16,7 +16,9 @@
  soma no vetor de estado.
 */
 pub trait DynamicModel {
-    fn name(&self) -> &'static str { "unnamed" }
+    fn name(&self) -> &'static str {
+        "unnamed"
+    }
 
     fn evaluate(&self);
 
@@ -36,6 +38,23 @@ pub trait DynamicModel {
     fn sensors(&self) -> Vec<(String, String)> {
         Vec::new()
     }
+
+    /** Chaves de estado que esse modelo declara como integráveis pelo
+    `Integrator` (seção 8.3/9.3 do plano). Cada chave `K` aqui precisa ter
+    sido ofertada em `subscribe()` junto com sua contraparte `"K.derivative"`
+    — é essa segunda chave que o `Integrator` lê pra saber quanto `K` muda
+    por tempo (ex.: `Valve` oferece `"valve.feed_a.position"` +
+    `"valve.feed_a.position.derivative"` e declara só a primeira aqui).
+
+    Vazio por padrão, mesmo raciocínio de `sensors()`: a maioria dos
+    `DynamicModel` (ex.: `Reactor`) não tem derivada própria pra integrar —
+    quem sabe disso é sempre quem monta o composto, nunca o componente-folha
+    por si. Chamado por `Simulation::set_model()` junto com `sensors()`, no
+    mesmo momento (tipo ainda concreto, antes de virar `Box<dyn DynamicModel>`).
+    */
+    fn state_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /**Contrato de Composição: CompositeDynamicModel estende DynamicModel
@@ -43,7 +62,7 @@ pub trait DynamicModel {
  Só os DynamicModel que são nós compostos (ex.: TennesseeEastmanModel)
  implementam isso. Componentes-folha (Valve, Agitator) não implementam —
  tentar compô-los vira erro de compilação, não de runtime.
- 
+
  `add_dynamic` não declara slots nem funde template nenhum — quem declara
  slots é a inscrição de cada DynamicModel direto no StateRegistry (fora
  deste trait). O papel de `add_dynamic` é só ordenar: adiciona o

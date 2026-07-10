@@ -26,8 +26,10 @@ impl Snapshot {
     /// não for TOML válido — não valida nada sobre o *conteúdo* (isso é
     /// problema de quem consome, via `get()`).
     pub fn from_file(path: &str) -> Result<Self, String> {
-        let content = std::fs::read_to_string(path).map_err(|e| format!("Erro lendo arquivo '{path}': {e}"))?;
-        let root: toml::Value = toml::from_str(&content).map_err(|e| format!("Erro parseando TOML '{path}': {e}"))?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Erro lendo arquivo '{path}': {e}"))?;
+        let root: toml::Value =
+            toml::from_str(&content).map_err(|e| format!("Erro parseando TOML '{path}': {e}"))?;
 
         let mut values = HashMap::new();
         flatten(&root, String::new(), &mut values);
@@ -37,7 +39,9 @@ impl Snapshot {
     /// Constrói direto de pares já resolvidos — útil pra teste, sem
     /// precisar de um arquivo real no disco.
     pub fn from_pairs(pairs: &[(&str, f64)]) -> Self {
-        Self { values: pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect() }
+        Self {
+            values: pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
+        }
     }
 
     /// Lê o valor de uma chave achatada (ex.: `"state.reactor_vapor.A"`).
@@ -51,7 +55,11 @@ fn flatten(value: &toml::Value, prefix: String, out: &mut HashMap<String, f64>) 
     match value {
         toml::Value::Table(table) => {
             for (key, nested) in table {
-                let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
                 flatten(nested, path, out);
             }
         }

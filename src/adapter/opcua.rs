@@ -1,4 +1,4 @@
-// opcua_adapter.rs
+// src/adapter/opcua.rs
 //
 // Adaptador OPC-UA genérico (ver docs/issue55_opcua_refactor/plan_refactor.md,
 // seção 10): expõe sensores/atuadores via um servidor OPC-UA mínimo. Não
@@ -7,7 +7,7 @@
 // `actuator_names`) e as duas pontes thread-safe que a "Thread da planta"
 // já publica/consome (`SnapshotBus`/`CommandQueue`, ver
 // drawio/dynamicModel.drawio, aba "arquitetura"). Quem chama essa função é
-// `Simulation::run_model()`, nunca o usuário do framework direto.
+// `Simulation::run()`, nunca o usuário do framework direto.
 //
 // Requer a feature `opcua` — puxa async-opcua + tokio, pesados demais pra
 // serem dependência default do resto do crate.
@@ -32,8 +32,8 @@ use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager
 use opcua::server::ServerBuilder;
 use opcua::types::{DataValue, MessageSecurityMode, NodeId, NumericRange, StatusCode};
 
-use crate::command_queue::CommandQueue;
-use crate::snapshot_bus::SnapshotBus;
+use crate::adapter::command_queue::CommandQueue;
+use crate::adapter::snapshot_bus::SnapshotBus;
 
 const NAMESPACE_URI: &str = "urn:simulation-framework:opcua-adapter";
 
@@ -95,7 +95,12 @@ pub async fn serve(
         let mut address_space = address_space.write();
 
         let folder_id = NodeId::new(ns, "signals");
-        address_space.add_folder(&folder_id, "Signals", "Signals", &NodeId::objects_folder_id());
+        address_space.add_folder(
+            &folder_id,
+            "Signals",
+            "Signals",
+            &NodeId::objects_folder_id(),
+        );
 
         let sensor_nodes: Vec<(NodeId, String)> = sensor_names
             .into_iter()
@@ -155,7 +160,10 @@ pub async fn serve(
         }
     });
 
-    server.run().await.map_err(|e| format!("servidor OPC-UA encerrou com erro: {e}"))
+    server
+        .run()
+        .await
+        .map_err(|e| format!("servidor OPC-UA encerrou com erro: {e}"))
 }
 
 fn parse_endpoint(endpoint: &str) -> Result<(String, u16, String), String> {
@@ -167,6 +175,8 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, u16, String), String> {
     let (host, port) = authority
         .split_once(':')
         .ok_or_else(|| format!("endpoint '{endpoint}' precisa de host:porta"))?;
-    let port: u16 = port.parse().map_err(|_| format!("porta inválida em '{endpoint}'"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("porta inválida em '{endpoint}'"))?;
     Ok((host.to_string(), port, path))
 }
