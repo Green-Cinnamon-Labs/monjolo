@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 
 <p align="center">
-  <img src="assets/logo.svg" width="96" alt="monjolo">
+  <img src="assets/logo.svg" width="200" alt="monjolo">
 </p>
 
 **Monjolo is a deterministic runtime for continuous dynamic process simulation.**
