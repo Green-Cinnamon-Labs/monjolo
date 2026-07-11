@@ -1,6 +1,11 @@
 # monjolo
 
-Framework genérico de simulação de sistemas dinâmicos, em Rust — composição de modelos, integração numérica e exposição de sensores/atuadores via protocolos industriais. Não sabe nada de Tennessee Eastman, química, ou qualquer planta específica.
+[![License: Apache-2.0](https://img.shields.io/github/license/Green-Cinnamon-Labs/monjolo)](LICENSE)
+[![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
+
+**Monjolo is a deterministic runtime for continuous dynamic process simulation.**
+
+Ele roda modelos dinâmicos como processos vivos: um loop de simulação que integra o estado no tempo (RK4), componentes trocando sinais por nome (`DynamicModel`/`StateRegistry`), blocos de sensor/atuador de primeira ordem, e uma fronteira de I/O (`IoImage`) pensada para expor esses sinais a protocolos industriais — hoje um adapter OPC-UA opcional (feature `opcua`), com espaço para outros no futuro. É genérico de propósito: não sabe nada de Tennessee Eastman, química, ou qualquer planta específica.
 
 ---
 
@@ -156,6 +161,21 @@ cargo test --features opcua  # roda toda a suíte de testes de unidade
 - Não há cancelamento cooperativo: se a thread da planta e a do adapter estão rodando e uma morre, a outra não é avisada — cabe a quem chamou `run()` decidir encerrar o processo.
 - Sem testes de integração/exemplos separados ainda — a cobertura hoje é só `#[cfg(test)]` inline em cada módulo (12 testes no núcleo + feature `opcua`).
 - Sem versionamento/publicação formal (`0.1.0`, dependência local só).
+
+---
+
+## Licença
+
+O código deste repositório é licenciado sob [Apache-2.0](LICENSE). Dependências de terceiros mantêm suas próprias licenças — ver [NOTICE.md](NOTICE.md).
+
+Para auditar as licenças de todo o grafo de dependências (inclusive transitivas):
+
+```bash
+cargo install cargo-deny
+cargo deny check licenses
+```
+
+Vulnerabilidades de segurança: ver [SECURITY.md](SECURITY.md).
 
 ---
 
