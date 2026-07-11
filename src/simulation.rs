@@ -1,4 +1,4 @@
-// simulation-framework/simulation.rs
+// monjolo/simulation.rs
 //
 // Interface externa do framework — a fachada/builder pública que quem monta
 // uma planta (ex.: TennesseeEastmanModel) usa pra rodar de verdade. Tudo em

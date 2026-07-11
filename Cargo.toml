@@ -4,12 +4,12 @@
 # qualquer planta simulada pode reaproveitar.
 
 [package]
-name = "simulation_framework"
+name = "monjolo"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "simulation_framework"
+name = "monjolo"
 path = "src/lib.rs"
 
 [dependencies]

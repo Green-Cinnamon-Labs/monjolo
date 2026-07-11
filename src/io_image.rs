@@ -1,6 +1,6 @@
 // io_image.rs
 
-/** Fronteira externa mínima do simulation-framework (ver
+/** Fronteira externa mínima do monjolo (ver
  docs/issue55_opcua_refactor/plan_refactor.md, seção 10): o lugar único
  onde Sensores publicam valores e Atuadores recebem comandos, por nome
  semântico — análogo a uma imagem de I/O/tabela de tags/registradores

@@ -1,4 +1,4 @@
-// simulation-framework/lib.rs
+// monjolo/lib.rs
 pub mod actuator;
 pub mod adapter;
 pub mod disturbance;

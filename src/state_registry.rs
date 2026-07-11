@@ -1,4 +1,4 @@
-/**simulation-framework/state_registry.rs
+/**monjolo/state_registry.rs
 
 StateRegistry (ver docs/issue55_opcua_refactor/plan_refactor.md, seções 1.3,
 6 e 7). Guarda dois mundos, sempre distintos:

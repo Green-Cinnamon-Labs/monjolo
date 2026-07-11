@@ -35,7 +35,7 @@ use opcua::types::{DataValue, MessageSecurityMode, NodeId, NumericRange, StatusC
 use crate::adapter::command_queue::CommandQueue;
 use crate::adapter::snapshot_bus::SnapshotBus;
 
-const NAMESPACE_URI: &str = "urn:simulation-framework:opcua-adapter";
+const NAMESPACE_URI: &str = "urn:monjolo:opcua-adapter";
 
 /** Sobe um servidor OPC-UA: um node read-only por nome em `sensor_names`
 (lido de `snapshot` a cada tick), um node writable por nome em
@@ -57,7 +57,7 @@ pub async fn serve(
     let (host, port, path) = parse_endpoint(endpoint)?;
 
     let (server, handle) = ServerBuilder::new()
-        .application_name("simulation-framework OPC-UA adapter")
+        .application_name("monjolo OPC-UA adapter")
         .application_uri(NAMESPACE_URI)
         .host(host)
         .port(port)
