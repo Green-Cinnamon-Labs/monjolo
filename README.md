@@ -3,6 +3,10 @@
 [![License: Apache-2.0](https://img.shields.io/github/license/Green-Cinnamon-Labs/monjolo)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 
+<p align="center">
+  <img src="assets/logo.svg" width="96" alt="monjolo">
+</p>
+
 **Monjolo is a deterministic runtime for continuous dynamic process simulation.**
 
 Ele roda modelos dinâmicos como processos vivos: um loop de simulação que integra o estado no tempo (RK4), componentes trocando sinais por nome (`DynamicModel`/`StateRegistry`), blocos de sensor/atuador de primeira ordem, e uma fronteira de I/O (`IoImage`) pensada para expor esses sinais a protocolos industriais — hoje um adapter OPC-UA opcional (feature `opcua`), com espaço para outros no futuro. É genérico de propósito: não sabe nada de Tennessee Eastman, química, ou qualquer planta específica.

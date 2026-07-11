@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 1080" width="1240" height="1080" role="img" aria-label="monjolo">
+  <g fill="#d9cd47" stroke="#10193c" stroke-width="20" stroke-linejoin="round" stroke-linecap="round">
+    <!-- gancho / gamela (capta a água) -->
+    <path d="M 310 415
+             C 200 400, 90 410, 55 460
+             C 25 505, 55 560, 130 585
+             C 205 610, 290 600, 345 565
+             L 345 500
+             C 290 525, 220 528, 170 508
+             C 135 493, 120 468, 135 448
+             C 148 430, 175 428, 195 440
+             L 250 460
+             C 275 440, 295 425, 310 415
+             Z" />
+
+    <!-- viga principal -->
+    <path d="M 300 420
+             C 420 400, 560 415, 680 430
+             C 850 450, 1050 490, 1190 545
+             L 1190 630
+             C 1050 580, 850 545, 680 525
+             C 560 510, 420 495, 300 505
+             Z" />
+
+    <!-- bloco do pivô, acima da viga -->
+    <rect x="575" y="345" width="150" height="100" rx="35" />
+
+    <!-- perna de sustentação (fulcro) -->
+    <path d="M 590 505
+             L 735 505
+             L 760 890
+             Q 760 925 725 925
+             L 600 925
+             Q 565 925 568 890
+             Z" />
+
+    <!-- pino do pivô -->
+    <circle cx="660" cy="580" r="30" fill="#10193c" stroke="none" />
+
+    <!-- haste do malho -->
+    <rect x="985" y="590" width="110" height="190" rx="30" />
+
+    <!-- cabeça do malho -->
+    <rect x="900" y="740" width="280" height="190" rx="95" />
+  </g>
+</svg>
