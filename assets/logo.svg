@@ -55,13 +55,12 @@
       <circle cx="330" cy="690" r="5"/>
     </g>
 
-    <!-- tronco vertical -->
+    <!-- tronco vertical (termina de forma reta, como se tivesse entrado nos grãos) -->
     <path d="
       M 410 150
       C 425 125 575 125 590 150
-      L 590 705
-      C 585 742 550 770 500 770
-      C 450 770 415 742 410 705
+      L 590 700
+      Q 500 716 410 700
       Z"
       fill="#b8661d"/>
 
@@ -69,7 +68,7 @@
     <ellipse cx="500" cy="150" rx="90" ry="38" fill="#d98930"/>
 
     <!-- leve sombra do tronco -->
-    <path d="M 545 175 L 545 700 C 542 725 525 742 500 750"
+    <path d="M 545 175 L 545 695 Q 525 706 508 710"
           fill="none" stroke="#9a4d15" stroke-width="18" opacity="0.38"/>
 
     <!-- braço horizontal quase reto -->
@@ -97,8 +96,8 @@
 
     <!-- detalhes mínimos de madeira -->
     <g stroke="#8f4612" stroke-width="9" opacity="0.42">
-      <path d="M 445 210 L 445 650"/>
-      <path d="M 550 220 L 550 635"/>
+      <path d="M 445 210 L 445 675"/>
+      <path d="M 550 220 L 550 665"/>
       <path d="M 260 760 Q 300 800 350 820"/>
       <path d="M 650 820 Q 700 800 740 760"/>
     </g>
