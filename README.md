@@ -54,6 +54,10 @@ Interface central: `evaluate()` recalcula os valores/derivadas de um componente 
 
 Componentes-folha (ex.: `Valve`) não implementam `CompositeDynamicModel` — tentar compô-los é erro de compilação, não de runtime.
 
+### Limite estrutural: DAG, não DAE
+
+`CompositeDynamicModel::evaluate_children()` roda cada filho **uma única vez**, em ordem fixa de inserção — só correto se o grafo de dependências entre componentes for um DAG. Se dois componentes precisarem, no mesmo instante, do valor um do outro (ciclo algébrico — acoplamento forte, ex.: rede hidráulica com pressão-vazão implícita), uma passada não fecha e o resultado fica **silenciosamente** errado, sem panic. Fechar isso exigiria um solver iterativo (Newton/tearing) dentro da fase de avaliação — não existe hoje; é limitação estrutural do framework, não do TEP. O lugar reservado pra isso já tem nome: `Interator` (`numerical_method/interator.rs`), contraparte de `Integrator` para a dimensão algébrica — hoje só um trait vazio (`fn name()`), sem implementação nem assinatura de `step()` fechada; a discussão de como implementá-lo (candidato: Newton-Raphson) fica para depois.
+
 ### `StateRegistry`, `Proxy`, `ReadProxy`
 
 Guarda dois buffers distintos:
@@ -72,10 +76,6 @@ Enum fechado (hoje só `RK4`) — só o framework decide quais métodos existem,
 - **`sensor::model`** — `Sensor` lê `CurrentState` via `ReadProxy` e aplica um `SensorBehavior` plugável: `Ideal` (sem transformação), `Noisy` (ruído gaussiano), `Hysteresis` (banda morta).
 - **`disturbance::cubic`** — `DisturbanceChannel`: polinômio cúbico por partes, regenerado continuamente, com continuidade C¹ (valor e derivada) nas junções — produz um sinal aleatório suave.
 - **`snapshot`** — `Snapshot::from_file` achata um TOML qualquer em `"caminho.pontuado" -> f64`, sem saber o que cada chave significa; cada componente busca só as chaves que lhe interessam na sua própria construção.
-
-### `IoImage`
-
-Catálogo nomeado de sensores (leitura) e `CommandSink`s (escrita) — a fronteira externa mínima do framework, análoga a uma imagem de I/O de planta real. Não sabe nada de `DynamicModel`/RK4/`StateRegistry`; é o que um adapter de rede consome.
 
 ### `Simulation`
 
@@ -145,17 +145,6 @@ cargo build                  # núcleo, sem rede
 cargo build --features opcua # com o adapter OPC-UA
 cargo test --features opcua  # roda toda a suíte de testes de unidade
 ```
-
----
-
-## Quem consome isso hoje
-
-| Repositório | Papel |
-|---|---|
-| [`tep-plant`](https://github.com/Green-Cinnamon-Labs/tep-plant) (branch `composite`) | Implementa `TennesseeEastmanModel` sobre `monjolo` — a química/termodinâmica do TEP compostas a partir de `Reactor`/`Separator`/`Stripper`/`Compressor`, cada um um `DynamicModel`. É o consumidor de referência e o motivo do crate existir. |
-| [`spec-tennessee-eastman`](https://github.com/Green-Cinnamon-Labs/spec-tennessee-eastman) | Ponto de entrada do lab — decisões de arquitetura, experimentos e rastreamento de tarefas que atravessam todos os repositórios, incluindo este. |
-
-`monjolo` hoje é consumido só via *path dependency* local (`../monjolo`) — ainda não foi publicado como dependência `git`/crates.io separada; ver comentário no `Cargo.toml` do `tep-plant`.
 
 ---
 

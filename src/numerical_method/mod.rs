@@ -1,4 +1,5 @@
 pub mod integrator;
+pub mod interator;
 pub mod rk4;
 
 use integrator::Integrator;
