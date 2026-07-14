@@ -481,11 +481,11 @@ impl Simulation {
 
                     registry.borrow_mut().commit();
 
-                    for name in &sensor_names {
-                        if let Some(value) = io.read(name) {
-                            snapshot.publish(name, value);
-                        }
-                    }
+                    let readings: Vec<(&str, f64)> = sensor_names
+                        .iter()
+                        .filter_map(|name| io.read(name).map(|value| (name.as_str(), value)))
+                        .collect();
+                    snapshot.publish_all(readings);
 
                     std::thread::sleep(tick_interval);
                 }

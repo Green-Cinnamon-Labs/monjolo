@@ -4,7 +4,7 @@
 // consumidor externo (ex.: a "Thread do OPC-UA") — ver
 // drawio/dynamicModel.drawio, aba "arquitetura", nó "Sensor Snapshot Bus".
 //
-// A planta publica o valor de cada sensor aqui a cada tick (`publish`);
+// A planta publica todas as leituras do tick aqui, de uma vez (`publish_all`);
 // quem está do outro lado só lê (`read`) — nunca escreve. Só `std`, sem
 // tokio: `Simulation::run()` usa isso incondicionalmente (mesmo sem a
 // feature `opcua`), então não pode depender de nada opcional.
@@ -26,16 +26,26 @@ impl SnapshotBus {
         Self::default()
     }
 
-    /// Chamado pela "Thread da planta", uma vez por sensor, a cada tick.
-    pub fn publish(&self, name: &str, value: f64) {
-        self.values
+    /** Chamado pela "Thread da planta" uma vez por tick, com todas as
+    leituras do tick já resolvidas. Toma o `write()` lock uma única vez pra
+    escrever todos os sensores na mesma seção crítica — ao contrário de
+    publicar um-a-um, um leitor concorrente nunca vê uma mistura de valores
+    de ticks diferentes entre variáveis distintas: o snapshot lido é sempre
+    ou o tick anterior inteiro, ou o tick atual inteiro.
+    */
+    pub fn publish_all<'a>(&self, readings: impl IntoIterator<Item = (&'a str, f64)>) {
+        let mut values = self
+            .values
             .write()
-            .expect("SnapshotBus: lock envenenado (uma thread escritora entrou em pânico)")
-            .insert(name.to_string(), value);
+            .expect("SnapshotBus: lock envenenado (uma thread escritora entrou em pânico)");
+        for (name, value) in readings {
+            values.insert(name.to_string(), value);
+        }
     }
 
-    /// Chamado por quem consome os valores publicados. `None` até o
-    /// primeiro `publish()` daquele nome.
+    /** Chamado por quem consome os valores publicados. `None` até o
+    primeiro `publish_all()` que inclua aquele nome.
+    */
     pub fn read(&self, name: &str) -> Option<f64> {
         self.values
             .read()
