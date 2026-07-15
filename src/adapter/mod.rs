@@ -5,16 +5,17 @@
 // `opcua`, mas o desenho já é "um dentre N possíveis" (MQTT, REST, etc.
 // poderiam entrar aqui do mesmo jeito no futuro).
 //
-// `command_queue`/`snapshot_bus` não são específicos de OPC-UA — são as
-// duas pontes thread-safe genéricas (SnapshotBus de leitura, CommandQueue
-// de escrita) que QUALQUER adapter usaria pra falar com a "Thread da
-// planta" sem tocar StateRegistry direto. Por isso moram aqui, não dentro
-// de `opcua.rs`.
+// `command_queue` não é específico de OPC-UA — é a ponte thread-safe
+// genérica (escrita) que QUALQUER adapter usaria pra falar com a "Thread da
+// planta" sem tocar StateRegistry direto. Por isso mora aqui, não dentro de
+// `opcua.rs`. Do lado da leitura não existe mais ponte nenhuma (Art. 11.4/3.6.6
+// do plano legislativo, 2026-07-15): `Sensor` é `Send + Sync` e é exportado
+// direto, via `Arc`, no handshake de boot (`ready_tx`, `simulation.rs`) —
+// qualquer adapter lê `sensor.read()` sem intermediário.
 
 pub mod command_queue;
 #[cfg(feature = "opcua")]
 pub mod opcua;
-pub mod snapshot_bus;
 
 /** Infraestrutura externa que `Simulation::run()` pode subir numa thread
 própria — mesmo raciocínio de `NumericalMethod` (numerical_method/mod.rs):

@@ -14,6 +14,7 @@
  memória, tosco de propósito.
 */
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::sensor::model::Sensor;
 
@@ -53,7 +54,7 @@ leitura (convenção: `sensors/<nome>`), atuadores como sinais de escrita
 */
 #[derive(Default)]
 pub struct IoImage {
-    readable: HashMap<String, Sensor>,
+    readable: HashMap<String, Arc<Sensor>>,
     writable: HashMap<String, Box<dyn CommandSink>>,
 }
 
@@ -62,13 +63,27 @@ impl IoImage {
         Self::default()
     }
 
-    /** Registra um `Sensor` já construído sob um nome. Não constrói o Sensor
-    aqui — quem já resolveu a chave contra o `StateRegistry` (seção 3.8 do
-    plano) entrega o `Sensor` pronto; `IoImage` não sabe nada de
-    `StateRegistry`/`ReadProxy`.
+    /** Registra um `Sensor` já construído sob um nome, como `Arc` — não
+    constrói o Sensor aqui; quem já resolveu a chave contra o
+    `StateRegistry` (seção 3.8 do plano) entrega o `Sensor` pronto;
+    `IoImage` não sabe nada de `StateRegistry`/`ReadProxy`. `Arc` (em vez de
+    posse exclusiva) porque o mesmo `Sensor` também é exportado pro
+    catálogo que atravessa pra Thread do Adaptador (`sensor_catalog()`,
+    Art. 11.4/11.8 do plano legislativo) — nunca é copiado, só compartilhado.
     */
-    pub fn register_sensor(&mut self, name: &str, sensor: Sensor) {
+    pub fn register_sensor(&mut self, name: &str, sensor: Arc<Sensor>) {
         self.readable.insert(name.to_string(), sensor);
+    }
+
+    /** Catálogo de sensores registrados, pronto pra exportar — cada clone
+    só incrementa o refcount do `Arc` (barato), nunca duplica `Sensor`/
+    `SensorBehavior`. Usado uma única vez, no handshake de boot (Art. 11.8/
+    11.9), pra dar à Thread do Adaptador (e a um futuro Controlador) acesso
+    direto a `sensor.read()` — sem depender da `IoImage` nem de nenhum
+    canal de publicação.
+    */
+    pub fn sensor_catalog(&self) -> HashMap<String, Arc<Sensor>> {
+        self.readable.clone()
     }
 
     /** Registra um sink de comando sob um nome. Ex.:
@@ -101,10 +116,13 @@ impl IoImage {
         self.writable.keys().map(String::as_str)
     }
 
-    /// Lê o valor atual de um sinal de leitura por nome. `None` se o nome
-    /// não existe ou não é um sinal de leitura.
-    pub fn read(&mut self, name: &str) -> Option<f64> {
-        self.readable.get_mut(name).map(|sensor| sensor.read())
+    /** Lê o valor atual de um sinal de leitura por nome. `None` se o nome
+    não existe ou não é um sinal de leitura. `&self`, não `&mut self`:
+    `Sensor::read()` (Art. 3.6.6) é `&self` — a mutação de `SensorBehavior`
+    fica atrás do `Mutex` interno do próprio `Sensor`.
+    */
+    pub fn read(&self, name: &str) -> Option<f64> {
+        self.readable.get(name).map(|sensor| sensor.read())
     }
 
     /// Escreve um comando num sinal de escrita por nome. `Err` se o nome
@@ -140,7 +158,7 @@ mod tests {
 
         let sensor = Sensor::new(registry, "reactor.temperature", Box::new(Ideal)).unwrap();
         let mut io = IoImage::new();
-        io.register_sensor("sensors/reactor.temperature", sensor);
+        io.register_sensor("sensors/reactor.temperature", Arc::new(sensor));
 
         assert_eq!(io.read("sensors/reactor.temperature"), Some(120.5));
         assert_eq!(io.read("sensors/does.not.exist"), None);
@@ -172,7 +190,7 @@ mod tests {
 
         let sensor = Sensor::new(registry, "reactor.temperature", Box::new(Ideal)).unwrap();
         let mut io = IoImage::new();
-        io.register_sensor("sensors/reactor.temperature", sensor);
+        io.register_sensor("sensors/reactor.temperature", Arc::new(sensor));
         io.register_actuator("actuators/cooling_water.command", |_v| {});
 
         let mut signals = io.signals();

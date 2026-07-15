@@ -1,7 +1,10 @@
 // src/adapter/command_queue.rs
 //
-// Ponte thread-safe de ESCRITA, sentido oposto ao SnapshotBus — ver
-// drawio/dynamicModel.drawio, aba "arquitetura", nó "Command Queue".
+// Ponte thread-safe de ESCRITA — a única ponte que sobrou entre a "Thread
+// da planta" e a "Thread do adapter" depois da eliminação do SnapshotBus
+// (Art. 11.4 do plano legislativo, 2026-07-15: leitura de sensor passou a
+// ser direta, via Arc<Sensor>, Art. 3.6.6). Ver drawio/dynamicModel.drawio, aba
+// "arquitetura", nó "Command Queue".
 //
 // Quem está fora da "Thread da planta" (ex.: um write callback do OPC-UA,
 // chamado de qualquer thread/tarefa que o servidor decidir usar) empurra

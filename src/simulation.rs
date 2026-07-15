@@ -15,13 +15,17 @@
 // `run()` sobe até dois serviços, cada um numa thread própria, só se tiver
 // sido configurado: a "Thread da planta" (se `set_model()` foi chamado) e a
 // "Thread do adapter" (se `set_adapter()` foi chamado — hoje só existe
-// AdapterConfig::OpcUa). As duas só se comunicam por SnapshotBus (leitura)
-// e CommandQueue (escrita) — nunca StateRegistry direto, porque
-// `Rc<RefCell<StateRegistry>>`, `IoImage`, `Sensor`, `Proxy` e o
-// `Box<dyn DynamicModel>` concreto não são `Send`: só podem nascer e viver
-// dentro da thread que os criou. Por isso `set_model`/`add_sensor`/
-// `add_actuator` recebem `+ Send` nas closures/comportamentos — são o que
-// cruza a fronteira; o que elas produzem nunca precisa ser Send.
+// AdapterConfig::OpcUa). As duas se comunicam de dois jeitos: leitura, direto
+// via `Arc<Sensor>` (Art. 11.4/3.6.6 do plano legislativo — cada sensor já
+// resolvido é exportado, uma vez, no handshake de boot; não existe mais
+// `SnapshotBus`), e escrita, via `CommandQueue`. `StateRegistry` continua
+// nunca cruzando thread direto: `Rc<RefCell<StateRegistry>>`, `IoImage`,
+// `Proxy` e o `Box<dyn DynamicModel>` concreto não são `Send` — só podem
+// nascer e viver dentro da thread que os criou. `Sensor`, ao contrário, É
+// `Send + Sync` (Art. 3.6.6) — pode ser compartilhado livremente. Por isso
+// `set_model`/`add_sensor`/`add_actuator` recebem `+ Send` nas closures/
+// comportamentos — são o que cruza a fronteira; o que elas produzem nunca
+// precisa ser Send (com a exceção, agora, do próprio `Sensor`).
 //
 // Sensores vêm de dois lugares, fundidos dentro da "Thread da planta": os
 // que `add_sensor()` declarou aqui de fora, e os que o próprio modelo
@@ -46,14 +50,15 @@
 // isso `run()` não força a thread sobrevivente a morrer, só para de
 // esperar por ela (ver comentário dentro de `run()`).
 
+use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[cfg(feature = "opcua")]
 use crate::adapter::command_queue::CommandQueue;
-use crate::adapter::snapshot_bus::SnapshotBus;
 use crate::adapter::AdapterConfig;
 use crate::dynamic_model::DynamicModel;
 use crate::io_image::{CommandSink, IoImage};
@@ -177,9 +182,10 @@ impl Simulation {
 
     /** Registra a infraestrutura externa (hoje só `AdapterConfig::OpcUa`)
     que `run()` deve subir numa thread própria, falando com a plant thread
-    só por `SnapshotBus`/`CommandQueue` — nunca por `StateRegistry` direto.
-    Só aceita o que `AdapterConfig` já implementa dentro do framework, mesmo
-    raciocínio de `set_numerical_method`.
+    por `Arc<Sensor>` (leitura direta, Art. 3.6.6) e `CommandQueue` (escrita)
+    — nunca por `StateRegistry` direto. Só aceita o que `AdapterConfig` já
+    implementa dentro do framework, mesmo raciocínio de
+    `set_numerical_method`.
     */
     pub fn set_adapter(&mut self, config: AdapterConfig) {
         self.adapter_config = Some(config);
@@ -286,8 +292,7 @@ impl Simulation {
 
         let (events_tx, events_rx) = std::sync::mpsc::channel::<ServiceEvent>();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<(String, f64)>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Vec<String>>();
-        let snapshot = SnapshotBus::new();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<HashMap<String, Arc<Sensor>>>();
 
         let plant_handle = model_factory.map(|factory| {
             Self::spawn_plant_thread(
@@ -297,7 +302,6 @@ impl Simulation {
                 tick_interval,
                 dt_hours,
                 numerical_method,
-                snapshot.clone(),
                 cmd_rx,
                 ready_tx,
                 events_tx.clone(),
@@ -310,7 +314,6 @@ impl Simulation {
             ready_rx,
             actuator_names,
             cmd_tx,
-            snapshot,
             events_tx,
         );
 
@@ -348,9 +351,10 @@ impl Simulation {
 
     /** Sobe a "Thread da planta": cria `StateRegistry`, o modelo, `IoImage`
     e os sensores/atuadores de verdade (nada disso existe antes desse
-    ponto), manda os nomes de sensor pro adapter via `ready_tx` (se algum
-    estiver esperando — inofensivo se ninguém estiver do outro lado) e entra
-    no loop de tick (integra via RK4 o que o modelo declarou em
+    ponto), manda o catálogo de sensores (nome -> `Arc<Sensor>`, Art. 11.8
+    do plano legislativo) pro adapter via `ready_tx` (se algum estiver
+    esperando — inofensivo se ninguém estiver do outro lado) e entra no
+    loop de tick (integra via RK4 o que o modelo declarou em
     `state_keys()`, ou só avalia se não há nada pra integrar).
 
     O corpo inteiro roda dentro de `catch_unwind` — um pânico aqui (seja na
@@ -364,9 +368,8 @@ impl Simulation {
         tick_interval: Duration,
         dt_hours: f64,
         numerical_method: NumericalMethod,
-        snapshot: SnapshotBus,
         cmd_rx: Receiver<(String, f64)>,
-        ready_tx: Sender<Vec<String>>,
+        ready_tx: Sender<HashMap<String, Arc<Sensor>>>,
         events: Sender<ServiceEvent>,
     ) -> JoinHandle<()> {
         std::thread::Builder::new()
@@ -407,33 +410,30 @@ impl Simulation {
                 let integrator = numerical_method.integrator();
 
                 let mut io = IoImage::new();
-                let mut sensor_names = Vec::new();
 
                 for (name, key, behavior) in external_sensor_specs {
                     let sensor =
                         Sensor::new(registry.clone(), &key, behavior).unwrap_or_else(|e| {
                             panic!("plant thread: sensor '{name}' (chave '{key}'): {e}")
                         });
-                    io.register_sensor(&name, sensor);
-                    sensor_names.push(name);
+                    io.register_sensor(&name, Arc::new(sensor));
                 }
                 for (name, key) in model_sensor_specs {
                     let sensor = Sensor::new(registry.clone(), &key, Box::new(Ideal))
                         .unwrap_or_else(|e| {
                             panic!("plant thread: sensor do modelo '{name}' (chave '{key}'): {e}")
                         });
-                    io.register_sensor(&name, sensor);
-                    sensor_names.push(name);
+                    io.register_sensor(&name, Arc::new(sensor));
                 }
                 for (name, sink) in actuator_specs {
                     io.register_actuator(&name, sink);
                 }
 
-                let _ = ready_tx.send(sensor_names.clone());
+                let _ = ready_tx.send(io.sensor_catalog());
 
                 eprintln!(
                     "[plant] iniciando — {} sensor(es), {} atuador(es), {} chave(s) de estado integrável, tick a cada {tick_interval:?} (dt = {dt_hours}h)",
-                    sensor_names.len(),
+                    io.sensor_names().count(),
                     io.actuator_names().count(),
                     state_proxies.len(),
                 );
@@ -481,12 +481,6 @@ impl Simulation {
 
                     registry.borrow_mut().commit();
 
-                    let readings: Vec<(&str, f64)> = sensor_names
-                        .iter()
-                        .filter_map(|name| io.read(name).map(|value| (name.as_str(), value)))
-                        .collect();
-                    snapshot.publish_all(readings);
-
                     std::thread::sleep(tick_interval);
                 }
             }));
@@ -502,9 +496,9 @@ impl Simulation {
 
     /** Sobe a "Thread do adapter" se `adapter_config` estiver presente —
      `None` caso contrário, sem tocar em `ready_rx`/`cmd_tx`/etc. Espera o
-     handshake de nomes de sensor via `ready_rx` só se existe uma plant
-     thread de verdade (`plant_handle.is_some()`); sem planta, sobe com
-     zero sensores. Se a planta morreu antes do handshake (`ready_rx`
+     handshake do catálogo de sensores via `ready_rx` só se existe uma
+     plant thread de verdade (`plant_handle.is_some()`); sem planta, sobe
+     com catálogo vazio. Se a planta morreu antes do handshake (`ready_rx`
      fechado), nem chega a subir o adapter — o pânico dela já está a
      caminho do canal de lifecycle.
     */
@@ -512,24 +506,22 @@ impl Simulation {
     fn spawn_adapter_if_configured(
         adapter_config: Option<AdapterConfig>,
         plant_handle: &Option<JoinHandle<()>>,
-        ready_rx: Receiver<Vec<String>>,
+        ready_rx: Receiver<HashMap<String, Arc<Sensor>>>,
         actuator_names: Vec<String>,
         cmd_tx: Sender<(String, f64)>,
-        snapshot: SnapshotBus,
         events: Sender<ServiceEvent>,
     ) -> Option<JoinHandle<()>> {
         let config = adapter_config?;
-        let sensor_names = if plant_handle.is_some() {
+        let sensors = if plant_handle.is_some() {
             ready_rx.recv().ok()?
         } else {
-            Vec::new()
+            HashMap::new()
         };
         let commands = CommandQueue::new(cmd_tx);
         Some(Self::spawn_adapter_thread(
             config,
-            sensor_names,
+            sensors,
             actuator_names,
-            snapshot,
             commands,
             events,
         ))
@@ -539,10 +531,9 @@ impl Simulation {
     fn spawn_adapter_if_configured(
         _adapter_config: Option<AdapterConfig>,
         _plant_handle: &Option<JoinHandle<()>>,
-        _ready_rx: Receiver<Vec<String>>,
+        _ready_rx: Receiver<HashMap<String, Arc<Sensor>>>,
         _actuator_names: Vec<String>,
         _cmd_tx: Sender<(String, f64)>,
-        _snapshot: SnapshotBus,
         _events: Sender<ServiceEvent>,
     ) -> Option<JoinHandle<()>> {
         None
@@ -558,9 +549,8 @@ impl Simulation {
     #[cfg(feature = "opcua")]
     fn spawn_adapter_thread(
         config: AdapterConfig,
-        sensor_names: Vec<String>,
+        sensors: HashMap<String, Arc<Sensor>>,
         actuator_names: Vec<String>,
-        snapshot: SnapshotBus,
         commands: CommandQueue,
         events: Sender<ServiceEvent>,
     ) -> JoinHandle<()> {
@@ -575,7 +565,7 @@ impl Simulation {
 
                         eprintln!(
                     "[adapter] iniciando — OPC-UA em {endpoint}, {} sensor(es), {} atuador(es)",
-                    sensor_names.len(),
+                    sensors.len(),
                     actuator_names.len(),
                 );
 
@@ -589,9 +579,8 @@ impl Simulation {
                             .build()
                             .map_err(|e| format!("falha ao criar runtime tokio pro OPC-UA: {e}"))?;
                         runtime.block_on(crate::adapter::opcua::serve(
-                            sensor_names,
+                            sensors,
                             actuator_names,
-                            snapshot,
                             commands,
                             &endpoint,
                         ))
@@ -614,7 +603,6 @@ impl Simulation {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     /// Modelo mínimo só pra provar que `run()` tica de verdade — não tem
     /// estado no StateRegistry nenhum, só conta quantas vezes `evaluate()`

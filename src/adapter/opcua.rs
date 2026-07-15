@@ -1,20 +1,23 @@
 // src/adapter/opcua.rs
 //
 // Adaptador OPC-UA genérico (ver docs/issue55_opcua_refactor/plan_refactor.md,
-// seção 10): expõe sensores/atuadores via um servidor OPC-UA mínimo. Não
-// sabe nada de TEP/química/planta específica, nem de `Simulation`/
-// `StateRegistry`/`IoImage` — só recebe nomes (`sensor_names`/
-// `actuator_names`) e as duas pontes thread-safe que a "Thread da planta"
-// já publica/consome (`SnapshotBus`/`CommandQueue`, ver
-// drawio/dynamicModel.drawio, aba "arquitetura"). Quem chama essa função é
+// seção 10; plan_refactor_legislativo.md, Art. 11.5): expõe sensores/
+// atuadores via um servidor OPC-UA mínimo. Não sabe nada de TEP/química/
+// planta específica, nem de `Simulation`/`StateRegistry`/`IoImage` — só
+// recebe um catálogo de `Arc<Sensor>` por nome (leitura) e o `CommandQueue`
+// (escrita) que a "Thread da planta" expõe. Quem chama essa função é
 // `Simulation::run()`, nunca o usuário do framework direto.
 //
 // Requer a feature `opcua` — puxa async-opcua + tokio, pesados demais pra
 // serem dependência default do resto do crate.
 //
 // Sensores viram nodes read-only, atualizados por push (`set_values`) a
-// cada tick, lendo do `SnapshotBus` — nunca por `add_read_callback`, porque
-// o valor já está publicado, não precisa ser computado sob demanda.
+// cada tick, chamando `sensor.read()` direto em cada `Arc<Sensor>` — o
+// mesmo objeto que a Thread da planta construiu, compartilhado (não
+// copiado) via o handshake de boot (`ready_tx`, ver simulation.rs). Não
+// existe mais `SnapshotBus`: `Sensor::read()` já garante, sozinho (Art.
+// 11.9), que duas leituras dentro da mesma `generation` de `CurrentState`
+// devolvem o mesmo valor — não há nada pra "publicar" antecipadamente.
 //
 // Atuadores viram nodes writable com um `add_write_callback` de verdade —
 // esse callback é `Fn(...) + Send + Sync + 'static` (exigência do
@@ -26,6 +29,8 @@
 // 2026-07-15: current_thread — sem trabalho paralelo real a justificar
 // um pool de worker threads).
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use opcua::crypto::SecurityPolicy;
@@ -36,13 +41,14 @@ use opcua::server::ServerBuilder;
 use opcua::types::{DataValue, MessageSecurityMode, NodeId, NumericRange, StatusCode};
 
 use crate::adapter::command_queue::CommandQueue;
-use crate::adapter::snapshot_bus::SnapshotBus;
+use crate::sensor::model::Sensor;
 
 const NAMESPACE_URI: &str = "urn:monjolo:opcua-adapter";
 
-/** Sobe um servidor OPC-UA: um node read-only por nome em `sensor_names`
-(lido de `snapshot` a cada tick), um node writable por nome em
-`actuator_names` (escrita empurrada em `commands`).
+/** Sobe um servidor OPC-UA: um node read-only por sensor em `sensors`
+(lido via `sensor.read()` a cada tick — já passa pelo `SensorBehavior` do
+próprio sensor, Art. 3.6/11.9 do plano legislativo), um node writable por
+nome em `actuator_names` (escrita empurrada em `commands`).
 
 `endpoint` no formato `opc.tcp://<host>:<porta><path>`, ex.:
 `"opc.tcp://0.0.0.0:4840/tep/server/"`.
@@ -51,9 +57,8 @@ Bloqueia até o servidor encerrar (erro fatal — não há shutdown gracioso
 ainda).
 */
 pub async fn serve(
-    sensor_names: Vec<String>,
+    sensors: HashMap<String, Arc<Sensor>>,
     actuator_names: Vec<String>,
-    snapshot: SnapshotBus,
     commands: CommandQueue,
     endpoint: &str,
 ) -> Result<(), String> {
@@ -93,7 +98,7 @@ pub async fn serve(
         .get_namespace_index(NAMESPACE_URI)
         .ok_or_else(|| "namespace não registrado".to_string())?;
 
-    let sensor_nodes: Vec<(NodeId, String)> = {
+    let sensor_nodes: Vec<(NodeId, Arc<Sensor>)> = {
         let address_space = node_manager.address_space();
         let mut address_space = address_space.write();
 
@@ -105,15 +110,15 @@ pub async fn serve(
             &NodeId::objects_folder_id(),
         );
 
-        let sensor_nodes: Vec<(NodeId, String)> = sensor_names
+        let sensor_nodes: Vec<(NodeId, Arc<Sensor>)> = sensors
             .into_iter()
-            .map(|name| {
+            .map(|(name, sensor)| {
                 let node_id = NodeId::new(ns, name.clone());
                 let _ = address_space.add_variables(
                     vec![Variable::new(&node_id, name.as_str(), name.as_str(), 0f64)],
                     &folder_id,
                 );
-                (node_id, name)
+                (node_id, sensor)
             })
             .collect();
 
@@ -153,10 +158,7 @@ pub async fn serve(
 
             let updates: Vec<_> = sensor_nodes
                 .iter()
-                .map(|(node_id, name)| {
-                    let value = snapshot.read(name).unwrap_or(f64::NAN);
-                    (node_id, None, DataValue::new_now(value))
-                })
+                .map(|(node_id, sensor)| (node_id, None, DataValue::new_now(sensor.read())))
                 .collect();
 
             let _ = node_manager.set_values(&subscriptions, updates.into_iter());
