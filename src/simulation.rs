@@ -579,7 +579,14 @@ impl Simulation {
                     actuator_names.len(),
                 );
 
-                        let runtime = tokio::runtime::Runtime::new()
+                        // current_thread, não multi_thread: o adaptador é
+                        // I/O-bound (um listener TCP, poucas conexões, uma
+                        // tarefa de push a cada 500ms) — não há trabalho
+                        // paralelo real que justifique um pool de worker
+                        // threads dimensionado por núcleo.
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
                             .map_err(|e| format!("falha ao criar runtime tokio pro OPC-UA: {e}"))?;
                         runtime.block_on(crate::adapter::opcua::serve(
                             sensor_names,

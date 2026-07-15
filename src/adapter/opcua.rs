@@ -20,8 +20,11 @@
 // esse callback é `Fn(...) + Send + Sync + 'static` (exigência do
 // SimpleNodeManager) e só toca o `CommandQueue` (que é Send+Sync de
 // verdade, ao contrário do que tínhamos antes com `Simulation`/`IoImage`
-// direto) — sem LocalSet/spawn_local, sem runtime current_thread: nada
-// aqui é !Send, então roda no runtime tokio padrão.
+// direto) — sem LocalSet/spawn_local: nada aqui é !Send, então roda de
+// graça em `tokio::spawn` comum, independente do runtime rodar em
+// current_thread ou multi_thread (ver simulation.rs, `spawn_adapter_thread`,
+// 2026-07-15: current_thread — sem trabalho paralelo real a justificar
+// um pool de worker threads).
 
 use std::time::Duration;
 

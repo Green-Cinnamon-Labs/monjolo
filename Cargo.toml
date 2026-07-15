@@ -18,7 +18,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
 toml = "0.8"
 opcua = { package = "async-opcua", version = "0.18", features = ["server"], optional = true }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"], optional = true }
+tokio = { version = "1", features = ["rt", "time"], optional = true }
 
 [features]
 # Adaptador OPC-UA (opcua_adapter) — puxa async-opcua + tokio, pesados
