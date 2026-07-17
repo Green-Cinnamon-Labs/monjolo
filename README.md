@@ -9,85 +9,85 @@
 
 **Monjolo is a deterministic runtime for continuous dynamic process simulation.**
 
-Ele roda modelos dinâmicos como processos vivos: um loop de simulação que integra o estado no tempo (RK4), componentes trocando sinais por nome (`DynamicModel`/`StateRegistry`), blocos de sensor/atuador de primeira ordem, e uma fronteira de I/O (`IoImage`) pensada para expor esses sinais a protocolos industriais — hoje um adapter OPC-UA opcional (feature `opcua`), com espaço para outros no futuro. É genérico de propósito: não sabe nada de Tennessee Eastman, química, ou qualquer planta específica.
+It runs dynamic models as living processes: a simulation loop that integrates state over time (RK4), components exchanging signals by name (`DynamicModel`/`StateRegistry`), first-order sensor/actuator blocks, and an I/O boundary (`IoImage`) designed to expose those signals to industrial protocols — today an optional OPC-UA adapter (`opcua` feature), with room for others in the future. It is general-purpose: it knows nothing about Tennessee Eastman, chemistry, or any specific plant.
 
 ---
 
-## O nome
+## The name
 
-Um monjolo é uma máquina hidráulica rústica de descascar/moer grãos, movida continuamente pela força da água — símbolo marcante da cultura caipira e do interior do Brasil, apesar de sua origem oriental. A metáfora é direta: este crate é o mecanismo que gira sozinho, tick após tick, movido pela integração numérica — e qualquer coisa que se queira "moer" (um reator, um pêndulo, uma rede de tanques) se encaixa nele sem que o mecanismo em si precise saber o que está processando.
-
----
-
-## Origem
-
-Este crate nasceu de dentro do [`tep-plant`](https://github.com/Green-Cinnamon-Labs/tep-plant), o simulador Rust do Tennessee Eastman Process (TEP) do laboratório — que por sua vez é um fork de [`camaramm/tennessee-eastman-profBraatz`](https://github.com/camaramm/tennessee-eastman-profBraatz), a implementação FORTRAN de referência do modelo de Downs & Vogel (1993).
-
-Durante a refatoração do `tep-plant` para expor a planta via OPC-UA (ver `spec-tennessee-eastman`, issues #55/#57), ficou claro que boa parte do código não tinha nada a ver com Tennessee Eastman: gerenciamento de estado, integração numérica (RK4), dinâmica de primeira ordem de válvulas/atuadores, geração de distúrbios, carregamento de condição inicial, o ciclo de vida de threads (planta + adapter) — tudo isso era genérico, reaproveitável por qualquer planta simulada. Só a química, a termodinâmica e a topologia dos subsistemas (reator, separador, stripper, compressor) eram, de fato, específicas do TEP.
-
-Separar essas duas coisas teve dois motivos:
-
-- **Pedagógico**: outros alunos podem montar seus próprios modelos dinâmicos sobre o `monjolo` sem precisar entender ou reescrever a maquinaria de simulação — só implementam `DynamicModel` para o que for específico do seu problema.
-- **Organizacional**: a separação de responsabilidades tornou o próprio `tep-plant` mais fácil de entender e evoluir, e deixou mais fácil enxergar onde cada melhoria (um novo integrador, um novo adapter, um novo tipo de sensor) realmente pertence.
+A *monjolo* is a rustic hydraulic machine for husking/grinding grain, driven continuously by the force of water — a distinctive symbol of rural Brazilian culture, despite its Asian origin. The metaphor is direct: this crate is the mechanism that turns on its own, tick after tick, driven by numerical integration — and whatever you want to "grind" (a reactor, a pendulum, a tank network) fits into it without the mechanism itself needing to know what it's processing.
 
 ---
 
-## O que é / o que não é
+## Origin
 
-**É:**
-- Um jeito de compor modelos dinâmicos (`DynamicModel`) em árvore, cada um lendo/escrevendo seu próprio estado por nome semântico.
-- Um integrador numérico (RK4) desacoplado de tudo — só soma vetores de estado a partir de uma closure `dynamics`.
-- Blocos genéricos reaproveitáveis: atuador de 1ª ordem (`Valve`, `Agitator`), sensor com comportamento plugável (`Ideal`, `Noisy`, `Hysteresis`), canal de distúrbio cúbico C¹-contínuo.
-- Um runtime supervisionado (`Simulation`) que roda a planta e, opcionalmente, um adapter de rede (hoje só OPC-UA) em threads separadas.
+This crate was born inside [`tep-plant`](https://github.com/Green-Cinnamon-Labs/tep-plant), the lab's Rust simulator for the Tennessee Eastman Process (TEP) — itself a fork of [`camaramm/tennessee-eastman-profBraatz`](https://github.com/camaramm/tennessee-eastman-profBraatz), the reference FORTRAN implementation of the Downs & Vogel (1993) model.
 
-**Não é:**
-- Um simulador do Tennessee Eastman — isso é o `tep-plant`, que consome este crate.
-- Um framework de controle — não há noção de controlador/malha aqui; isso é responsabilidade de quem constrói o modelo (ou de um repositório supervisório, como o `tep-operator`).
+During the refactor of `tep-plant` to expose the plant via OPC-UA (see `spec-tennessee-eastman`, issues #55/#57), it became clear that a large part of the code had nothing to do with Tennessee Eastman: state management, numerical integration (RK4), first-order valve/actuator dynamics, disturbance generation, initial-condition loading, thread lifecycle (plant + adapter) — all of that was generic, reusable by any simulated plant. Only the chemistry, thermodynamics, and subsystem topology (reactor, separator, stripper, compressor) were actually TEP-specific.
+
+Separating these two things had two motivations:
+
+- **Pedagogical**: other students can build their own dynamic models on top of `monjolo` without needing to understand or rewrite the simulation machinery — they just implement `DynamicModel` for whatever is specific to their problem.
+- **Organizational**: the separation of concerns made `tep-plant` itself easier to understand and evolve, and made it clearer where each improvement (a new integrator, a new adapter, a new sensor type) actually belongs.
 
 ---
 
-## Conceitos centrais
+## What it is / what it isn't
+
+**It is:**
+- A way to compose dynamic models (`DynamicModel`) into a tree, each reading/writing its own state by semantic name.
+- A numerical integrator (RK4) decoupled from everything else — it just sums state vectors from a `dynamics` closure.
+- Generic reusable blocks: 1st-order actuator (`Valve`, `Agitator`), sensor with pluggable behavior (`Ideal`, `Noisy`, `Hysteresis`), C¹-continuous cubic disturbance channel.
+- A supervised runtime (`Simulation`) that runs the plant and, optionally, a network adapter (today only OPC-UA) on separate threads.
+
+**It is not:**
+- A Tennessee Eastman simulator — that's `tep-plant`, which consumes this crate.
+- A control framework — there's no notion of controller/loop here; that's the responsibility of whoever builds the model (or of a supervisory repository, like `tep-operator`).
+
+---
+
+## Core concepts
 
 ### `DynamicModel` / `CompositeDynamicModel`
 
-Interface central: `evaluate()` recalcula os valores/derivadas de um componente lendo/escrevendo via `Proxy`s que ele já guarda desde a inscrição — nunca por lookup de string no caminho quente. `CompositeDynamicModel` é o supertrait de quem orquestra outros: `add_dynamic()` só ordena a sequência de avaliação, cada componente-filho é quem declara seus próprios slots ao se inscrever no `StateRegistry`.
+Central interface: `evaluate()` recomputes a component's values/derivatives by reading/writing through `Proxy`s it already holds since subscription — never via a string lookup on the hot path. `CompositeDynamicModel` is the supertrait for anything orchestrating others: `add_dynamic()` only orders the evaluation sequence; each child component is the one declaring its own slots when it subscribes to the `StateRegistry`.
 
-Componentes-folha (ex.: `Valve`) não implementam `CompositeDynamicModel` — tentar compô-los é erro de compilação, não de runtime.
+Leaf components (e.g. `Valve`) do not implement `CompositeDynamicModel` — trying to compose them is a compile-time error, not a runtime one.
 
-### Limite estrutural: DAG, não DAE
+### Structural limit: DAG, not DAE
 
-`CompositeDynamicModel::evaluate_children()` roda cada filho **uma única vez**, em ordem fixa de inserção — só correto se o grafo de dependências entre componentes for um DAG. Se dois componentes precisarem, no mesmo instante, do valor um do outro (ciclo algébrico — acoplamento forte, ex.: rede hidráulica com pressão-vazão implícita), uma passada não fecha e o resultado fica **silenciosamente** errado, sem panic. Fechar isso exigiria um solver iterativo (Newton/tearing) dentro da fase de avaliação — não existe hoje; é limitação estrutural do framework, não do TEP. O lugar reservado pra isso já tem nome: `Interator` (`numerical_method/interator.rs`), contraparte de `Integrator` para a dimensão algébrica — hoje só um trait vazio (`fn name()`), sem implementação nem assinatura de `step()` fechada; a discussão de como implementá-lo (candidato: Newton-Raphson) fica para depois.
+`CompositeDynamicModel::evaluate_children()` runs each child **exactly once**, in fixed insertion order — only correct if the dependency graph between components is a DAG. If two components need each other's value at the same instant (an algebraic cycle — strong coupling, e.g. a hydraulic network with implicit pressure-flow relations), a single pass doesn't close and the result is **silently** wrong, with no panic. Closing that would require an iterative solver (Newton/tearing) inside the evaluation phase — it doesn't exist today; this is a structural limitation of the framework, not of TEP. The place reserved for this already has a name: `Interator` (`numerical_method/interator.rs`), the algebraic-dimension counterpart to `Integrator` — today just an empty trait (`fn name()`), with no implementation nor a settled `step()` signature; the discussion of how to implement it (candidate: Newton-Raphson) is left for later.
 
 ### `StateRegistry`, `Proxy`, `ReadProxy`
 
-Guarda dois buffers distintos:
-- `EvaluationState` — cópia de trabalho de uma rodada de avaliação, pode conter valores hipotéticos (sub-passos do RK4). Endereçado por `Proxy`.
-- `CurrentState` — o último estado confirmado. Endereçado só por `ReadProxy` (somente leitura, nunca hipotético), usado por `Sensor`.
+Holds two distinct buffers:
+- `EvaluationState` — working copy for one evaluation round, may contain hypothetical values (RK4 sub-steps). Addressed by `Proxy`.
+- `CurrentState` — the last confirmed state. Addressed only by `ReadProxy` (read-only, never hypothetical), used by `Sensor`.
 
-`subscribe(offers, needs)` reserva slots e devolve `Proxy`s; posições são append-only e resolvidas **uma única vez** — depois disso, leitura/escrita é indexação direta em `Vec<Cell<f64>>`, sem hashing. `commit()` copia `EvaluationState → CurrentState` no fim de cada tick.
+`subscribe(offers, needs)` reserves slots and returns `Proxy`s; positions are append-only and resolved **exactly once** — after that, reading/writing is direct indexing into a `Vec<Cell<f64>>`, no hashing. `commit()` copies `EvaluationState → CurrentState` at the end of each tick.
 
 ### `NumericalMethod` / `Integrator`
 
-Enum fechado (hoje só `RK4`) — só o framework decide quais métodos existem, para não deixar `Simulation` aceitar um integrador arbitrário de fora. O `Integrator` não sabe nada de `Proxy`/`DynamicModel`: recebe um vetor de estado e uma closure `dynamics: &[f64] -> Vec<f64>`, devolve o próximo estado.
+Closed enum (today only `RK4`) — only the framework decides which methods exist, so `Simulation` can't be handed an arbitrary integrator from outside. The `Integrator` knows nothing about `Proxy`/`DynamicModel`: it receives a state vector and a `dynamics: &[f64] -> Vec<f64>` closure, and returns the next state.
 
-### Blocos genéricos
+### Generic blocks
 
-- **`actuator::dynamic`** — `Valve`/`Agitator`: atraso de 1ª ordem, `d(posição)/dt = (comando - posição) / τ`.
-- **`sensor::model`** — `Sensor` lê `CurrentState` via `ReadProxy` e aplica um `SensorBehavior` plugável: `Ideal` (sem transformação), `Noisy` (ruído gaussiano), `Hysteresis` (banda morta).
-- **`disturbance::cubic`** — `DisturbanceChannel`: polinômio cúbico por partes, regenerado continuamente, com continuidade C¹ (valor e derivada) nas junções — produz um sinal aleatório suave.
-- **`snapshot`** — `Snapshot::from_file` achata um TOML qualquer em `"caminho.pontuado" -> f64`, sem saber o que cada chave significa; cada componente busca só as chaves que lhe interessam na sua própria construção.
+- **`actuator::dynamic`** — `Valve`/`Agitator`: 1st-order lag, `d(position)/dt = (command - position) / τ`.
+- **`sensor::model`** — `Sensor` reads `CurrentState` via `ReadProxy` and applies a pluggable `SensorBehavior`: `Ideal` (no transformation), `Noisy` (Gaussian noise), `Hysteresis` (dead band).
+- **`disturbance::cubic`** — `DisturbanceChannel`: piecewise cubic polynomial, continuously regenerated, with C¹ continuity (value and derivative) at the joints — produces a smooth random signal.
+- **`snapshot`** — `Snapshot::from_file` flattens any TOML file into `"dotted.path" -> f64`, without knowing what each key means; each component fetches only the keys it cares about during its own construction.
 
 ### `Simulation`
 
-Builder até `run()` ser chamado (`set_model`, `set_adapter`, `add_sensor`, `add_actuator` só guardam definições). `run()` sobe até duas threads supervisionadas — "thread da planta" e "thread do adapter" — que só se comunicam por `SnapshotBus` (leitura) e `CommandQueue` (escrita), nunca pelo `StateRegistry` direto (que não é `Send`). Cada thread reporta exatamente um `ServiceEvent` (`Stopped`/`Failed`/`Panicked`, este último via `catch_unwind`) antes de encerrar; `run()` retorna assim que a primeira delas morrer.
+A builder until `run()` is called (`set_model`, `set_adapter`, `add_sensor`, `add_actuator` only store definitions). `run()` spawns up to two supervised threads — the "plant thread" and the "adapter thread" — which only communicate via `SnapshotBus` (read) and `CommandQueue` (write), never directly through `StateRegistry` (which isn't `Send`). Each thread reports exactly one `ServiceEvent` (`Stopped`/`Failed`/`Panicked`, the latter via `catch_unwind`) before exiting; `run()` returns as soon as the first one dies.
 
-### Adapters (feature `opcua`)
+### Adapters (`opcua` feature)
 
-`AdapterConfig` também é um enum fechado — hoje só `OpcUa { endpoint }`. Sobe um servidor OPC-UA (via `async-opcua` + `tokio`, num runtime próprio criado dentro da thread do adapter) expondo cada sensor/atuador declarado como um node. `opcua`/`tokio` são dependências opcionais, atrás da feature `opcua`: o núcleo do framework não paga esse custo se não precisar de rede.
+`AdapterConfig` is also a closed enum — today only `OpcUa { endpoint }`. It spins up an OPC-UA server (via `async-opcua` + `tokio`, on its own runtime created inside the adapter thread) exposing each declared sensor/actuator as a node. `opcua`/`tokio` are optional dependencies, gated behind the `opcua` feature: the framework's core doesn't pay that cost unless it needs networking.
 
 ---
 
-## Como usar
+## Usage
 
 ```rust
 use monjolo::adapter::AdapterConfig;
@@ -96,7 +96,7 @@ use monjolo::numerical_method::NumericalMethod;
 use monjolo::simulation::Simulation;
 use monjolo::state_registry::{Proxy, StateRegistry};
 
-// Um DynamicModel mínimo: decaimento exponencial dv/dt = -v.
+// A minimal DynamicModel: exponential decay dv/dt = -v.
 struct Decay {
     value: Proxy,
     derivative: Proxy,
@@ -125,54 +125,54 @@ fn main() {
     simulation.set_model(Decay::new);
     simulation.set_numerical_method(NumericalMethod::RK4);
     simulation.set_adapter(AdapterConfig::OpcUa { endpoint: "opc.tcp://0.0.0.0:4840/demo/".into() });
-    simulation.run().expect("run encerrou com erro");
+    simulation.run().expect("run ended with an error");
 }
 ```
 
-Para um exemplo real e mais rico (composição de vários subsistemas, condição inicial via `Snapshot`, sensores declarados pelo próprio modelo), veja como o [`tep-plant`](https://github.com/Green-Cinnamon-Labs/tep-plant) (branch `composite`) implementa `TennesseeEastmanModel` sobre este crate — `src/model.rs` e `src/bin/tep_plant.rs`.
+For a richer, real-world example (composition of several subsystems, initial condition via `Snapshot`, sensors declared by the model itself), see how [`tep-plant`](https://github.com/Green-Cinnamon-Labs/tep-plant) (`composite` branch) implements `TennesseeEastmanModel` on top of this crate — `src/model.rs` and `src/bin/tep_plant.rs`.
 
 ---
 
-## Features do Cargo
+## Cargo Features
 
-| Feature | Padrão | O que ativa |
+| Feature | Default | What it enables |
 |---|---|---|
-| *(nenhuma)* | — | Núcleo: `DynamicModel`, `StateRegistry`, `NumericalMethod`/RK4, atuador/sensor/distúrbio, `Snapshot`, `IoImage`. Só depende de `rand`/`rand_distr`/`toml`. |
-| `opcua` | desligada | Adiciona `adapter::opcua` — sobe `async-opcua` + `tokio` (dependências pesadas demais para serem padrão de um framework de simulação genérico). |
+| *(none)* | — | Core: `DynamicModel`, `StateRegistry`, `NumericalMethod`/RK4, actuator/sensor/disturbance, `Snapshot`, `IoImage`. Only depends on `rand`/`rand_distr`/`toml`. |
+| `opcua` | off | Adds `adapter::opcua` — pulls in `async-opcua` + `tokio` (dependencies too heavy to be the default for a generic simulation framework). |
 
 ```bash
-cargo build                  # núcleo, sem rede
-cargo build --features opcua # com o adapter OPC-UA
-cargo test --features opcua  # roda toda a suíte de testes de unidade
+cargo build                  # core, no networking
+cargo build --features opcua # with the OPC-UA adapter
+cargo test --features opcua  # runs the whole unit test suite
 ```
 
 ---
 
-## Estado atual / limitações conhecidas
+## Current state / known limitations
 
-- Só existe um método numérico (`RK4`) e um adapter (`OpcUa`) — os dois são enums fechados por design, então adicionar um novo é uma mudança no próprio crate, não uma extensão de fora.
-- Não há cancelamento cooperativo: se a thread da planta e a do adapter estão rodando e uma morre, a outra não é avisada — cabe a quem chamou `run()` decidir encerrar o processo.
-- Sem testes de integração/exemplos separados ainda — a cobertura hoje é só `#[cfg(test)]` inline em cada módulo (12 testes no núcleo + feature `opcua`).
-- Sem versionamento/publicação formal (`0.1.0`, dependência local só).
+- There's only one numerical method (`RK4`) and one adapter (`OpcUa`) — both are closed enums by design, so adding a new one is a change inside the crate itself, not an external extension.
+- No cooperative cancellation: if the plant thread and the adapter thread are both running and one dies, the other isn't notified — it's up to whoever called `run()` to decide to end the process.
+- No separate integration tests/examples yet — coverage today is only inline `#[cfg(test)]` in each module (12 tests in the core + `opcua` feature).
+- No formal versioning/publishing yet (`0.1.0`, local dependency only).
 
 ---
 
-## Licença
+## License
 
-O código deste repositório é licenciado sob [Apache-2.0](LICENSE). Dependências de terceiros mantêm suas próprias licenças — ver [NOTICE.md](NOTICE.md).
+The code in this repository is licensed under [Apache-2.0](LICENSE). Third-party dependencies keep their own licenses — see [NOTICE.md](NOTICE.md).
 
-Para auditar as licenças de todo o grafo de dependências (inclusive transitivas):
+To audit the licenses of the entire dependency graph (including transitive ones):
 
 ```bash
 cargo install cargo-deny
 cargo deny check licenses
 ```
 
-Vulnerabilidades de segurança: ver [SECURITY.md](SECURITY.md).
+Security vulnerabilities: see [SECURITY.md](SECURITY.md).
 
 ---
 
-## Testes
+## Tests
 
 ```bash
 cargo test --features opcua
