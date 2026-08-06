@@ -5,15 +5,13 @@
 // `opcua`, mas o desenho já é "um dentre N possíveis" (MQTT, REST, etc.
 // poderiam entrar aqui do mesmo jeito no futuro).
 //
-// `command_queue` não é específico de OPC-UA — é a ponte thread-safe
-// genérica (escrita) que QUALQUER adapter usaria pra falar com a "Thread da
-// planta" sem tocar StateRegistry direto. Por isso mora aqui, não dentro de
-// `opcua.rs`. Do lado da leitura não existe mais ponte nenhuma (Art. 11.4/3.6.6
-// do plano legislativo, 2026-07-15): `Sensor` é `Send + Sync` e é exportado
+// Não existe mais nenhuma ponte própria aqui, nem de leitura nem de
+// escrita (IoImage/CommandSink/CommandQueue eliminados): `Sensor` e
+// `Actuator` (actuator/model.rs) são ambos `Send + Sync` e são exportados
 // direto, via `Arc`, no handshake de boot (`ready_tx`, `simulation.rs`) —
-// qualquer adapter lê `sensor.read()` sem intermediário.
+// qualquer adapter lê `sensor.read()`/escreve `actuator.write()` sem
+// intermediário.
 
-pub mod command_queue;
 #[cfg(feature = "opcua")]
 pub mod opcua;
 

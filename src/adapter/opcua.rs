@@ -1,11 +1,10 @@
 // src/adapter/opcua.rs
 //
-// Adaptador OPC-UA genérico (ver docs/issue55_opcua_refactor/plan_refactor.md,
-// seção 10; plan_refactor_legislativo.md, Art. 11.5): expõe sensores/
-// atuadores via um servidor OPC-UA mínimo. Não sabe nada de TEP/química/
-// planta específica, nem de `Simulation`/`StateRegistry`/`IoImage` — só
-// recebe um catálogo de `Arc<Sensor>` por nome (leitura) e o `CommandQueue`
-// (escrita) que a "Thread da planta" expõe. Quem chama essa função é
+// Adaptador OPC-UA genérico: expõe sensores/atuadores via um servidor
+// OPC-UA mínimo. Não sabe nada de TEP/química/planta específica, nem de
+// `Simulation`/`StateRegistry` — só recebe um catálogo de `Arc<Sensor>`
+// (leitura) e um catálogo de `Arc<Actuator>` (escrita), ambos por nome, que
+// a "Thread da planta" já resolveu. Quem chama essa função é
 // `Simulation::run()`, nunca o usuário do framework direto.
 //
 // Requer a feature `opcua` — puxa async-opcua + tokio, pesados demais pra
@@ -15,19 +14,18 @@
 // cada tick, chamando `sensor.read()` direto em cada `Arc<Sensor>` — o
 // mesmo objeto que a Thread da planta construiu, compartilhado (não
 // copiado) via o handshake de boot (`ready_tx`, ver simulation.rs). Não
-// existe mais `SnapshotBus`: `Sensor::read()` já garante, sozinho (Art.
-// 11.9), que duas leituras dentro da mesma `generation` de `CurrentState`
+// existe bridge de leitura nenhuma: `Sensor::read()` já garante, sozinho,
+// que duas leituras dentro da mesma `generation` de `CurrentState`
 // devolvem o mesmo valor — não há nada pra "publicar" antecipadamente.
 //
 // Atuadores viram nodes writable com um `add_write_callback` de verdade —
 // esse callback é `Fn(...) + Send + Sync + 'static` (exigência do
-// SimpleNodeManager) e só toca o `CommandQueue` (que é Send+Sync de
-// verdade, ao contrário do que tínhamos antes com `Simulation`/`IoImage`
-// direto) — sem LocalSet/spawn_local: nada aqui é !Send, então roda de
-// graça em `tokio::spawn` comum, independente do runtime rodar em
-// current_thread ou multi_thread (ver simulation.rs, `spawn_adapter_thread`,
-// 2026-07-15: current_thread — sem trabalho paralelo real a justificar
-// um pool de worker threads).
+// SimpleNodeManager) e escreve direto no `Arc<Actuator>` daquele node
+// específico (também Send+Sync de verdade) — sem LocalSet/spawn_local, sem
+// bridge de escrita nenhuma: nada aqui é !Send, então roda de graça em
+// `tokio::spawn` comum, independente do runtime rodar em current_thread ou
+// multi_thread (ver simulation.rs, `spawn_adapter_thread` — current_thread:
+// sem trabalho paralelo real a justificar um pool de worker threads).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,15 +38,15 @@ use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager
 use opcua::server::ServerBuilder;
 use opcua::types::{DataValue, MessageSecurityMode, NodeId, NumericRange, StatusCode};
 
-use crate::adapter::command_queue::CommandQueue;
+use crate::actuator::model::Actuator;
 use crate::sensor::model::Sensor;
 
 const NAMESPACE_URI: &str = "urn:monjolo:opcua-adapter";
 
 /** Sobe um servidor OPC-UA: um node read-only por sensor em `sensors`
 (lido via `sensor.read()` a cada tick — já passa pelo `SensorBehavior` do
-próprio sensor, Art. 3.6/11.9 do plano legislativo), um node writable por
-nome em `actuator_names` (escrita empurrada em `commands`).
+próprio sensor), um node writable por sensor em `actuators` (escrita
+empurrada direto no `Arc<Actuator>` daquele node, via `actuator.write()`).
 
 `endpoint` no formato `opc.tcp://<host>:<porta><path>`, ex.:
 `"opc.tcp://0.0.0.0:4840/tep/server/"`.
@@ -58,8 +56,7 @@ ainda).
 */
 pub async fn serve(
     sensors: HashMap<String, Arc<Sensor>>,
-    actuator_names: Vec<String>,
-    commands: CommandQueue,
+    actuators: HashMap<String, Arc<Actuator>>,
     endpoint: &str,
 ) -> Result<(), String> {
     let (host, port, path) = parse_endpoint(endpoint)?;
@@ -122,14 +119,12 @@ pub async fn serve(
             })
             .collect();
 
-        for name in actuator_names {
+        for (name, actuator) in actuators {
             let node_id = NodeId::new(ns, name.clone());
             let mut var = Variable::new(&node_id, name.as_str(), name.as_str(), 0f64);
             var.set_writable(true);
             let _ = address_space.add_variables(vec![var], &folder_id);
 
-            let commands = commands.clone();
-            let cb_name = name.clone();
             node_manager.inner().add_write_callback(
                 node_id,
                 move |data_value: DataValue, _range: &NumericRange| match data_value
@@ -138,7 +133,7 @@ pub async fn serve(
                     .and_then(|v| v.as_f64())
                 {
                     Some(value) => {
-                        commands.write(&cb_name, value);
+                        actuator.write(value);
                         StatusCode::Good
                     }
                     None => StatusCode::BadTypeMismatch,

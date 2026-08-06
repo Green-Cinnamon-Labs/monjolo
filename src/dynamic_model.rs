@@ -22,23 +22,6 @@ pub trait DynamicModel {
 
     fn evaluate(&self);
 
-    /** Sinais que esse modelo declara como observáveis — pares (nome de
-    exposição, chave do `StateRegistry`). Vazio por padrão: a maioria dos
-    `DynamicModel` (folhas como `Reactor`/`Valve`) não declara nada, só quem
-    orquestra (ex.: `TennesseeEastmanModel`) sabe quais dos seus próprios
-    slots fazem sentido expor pra fora — a mesma relação que `add_dynamic`
-    tem com composição, `sensors` tem com observabilidade (drawio,
-    aba "arquitetura": "TennesseeEastmanModel --DECLARA--> Sensor").
-
-    Chamado por `Simulation::set_model()` uma única vez, com o modelo ainda
-    no tipo concreto (antes de virar `Box<dyn DynamicModel>`) — por isso o
-    `Simulation` nem precisa desse método pra tipos que não o sobrescrevem,
-    o default vazio já resolve.
-    */
-    fn sensors(&self) -> Vec<(String, String)> {
-        Vec::new()
-    }
-
     /** Chaves de estado que esse modelo declara como integráveis pelo
     `Integrator` (seção 8.3/9.3 do plano). Cada chave `K` aqui precisa ter
     sido ofertada em `subscribe()` junto com sua contraparte `"K.derivative"`
@@ -46,11 +29,11 @@ pub trait DynamicModel {
     por tempo (ex.: `Valve` oferece `"valve.feed_a.position"` +
     `"valve.feed_a.position.derivative"` e declara só a primeira aqui).
 
-    Vazio por padrão, mesmo raciocínio de `sensors()`: a maioria dos
-    `DynamicModel` (ex.: `Reactor`) não tem derivada própria pra integrar —
-    quem sabe disso é sempre quem monta o composto, nunca o componente-folha
-    por si. Chamado por `Simulation::set_model()` junto com `sensors()`, no
-    mesmo momento (tipo ainda concreto, antes de virar `Box<dyn DynamicModel>`).
+    Vazio por padrão: a maioria dos `DynamicModel` (ex.: `Reactor`) não tem
+    derivada própria pra integrar — quem sabe disso é sempre quem monta o
+    composto, nunca o componente-folha por si. Chamado por
+    `Simulation::set_model()`, com o tipo ainda concreto, antes de virar
+    `Box<dyn DynamicModel>`.
     */
     fn state_keys(&self) -> Vec<String> {
         Vec::new()

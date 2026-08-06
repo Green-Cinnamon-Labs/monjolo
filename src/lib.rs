@@ -1,9 +1,9 @@
 // monjolo/lib.rs
 pub mod actuator;
 pub mod adapter;
+pub mod controller;
 pub mod disturbance;
 pub mod dynamic_model;
-pub mod io_image;
 pub mod numerical_method;
 pub mod sensor;
 pub mod simulation;

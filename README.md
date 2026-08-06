@@ -9,7 +9,7 @@
 
 **Monjolo is a deterministic runtime for continuous dynamic process simulation.**
 
-It runs dynamic models as living processes: a simulation loop that integrates state over time (RK4), components exchanging signals by name (`DynamicModel`/`StateRegistry`), first-order sensor/actuator blocks, and an I/O boundary (`IoImage`) designed to expose those signals to industrial protocols — today an optional OPC-UA adapter (`opcua` feature), with room for others in the future. It is general-purpose: it knows nothing about Tennessee Eastman, chemistry, or any specific plant.
+It runs dynamic models as living processes: a simulation loop that integrates state over time (using RK4 for example), components exchanging signals by name (`DynamicModel`/`StateRegistry`), first-order sensor/actuator blocks, and a pair of `Send + Sync` boundary objects (`Sensor`, `Actuator`) designed to expose those signals directly to industrial protocols — today an optional OPC-UA adapter (`opcua` feature), with room for others in the future. It is general-purpose: it knows nothing about Tennessee Eastman, chemistry, or any specific plant.
 
 ---
 
@@ -72,14 +72,15 @@ Closed enum (today only `RK4`) — only the framework decides which methods exis
 
 ### Generic blocks
 
-- **`actuator::dynamic`** — `Valve`/`Agitator`: 1st-order lag, `d(position)/dt = (command - position) / τ`.
+- **`actuator::dynamic`** — `Valve`/`Agitator`: 1st-order lag, `d(position)/dt = (command - position) / τ`. Physical dynamics participating in `evaluate()`/RK4 — not to be confused with `Actuator` below.
+- **`actuator::model`** — `Actuator`: a `Send + Sync` write mailbox mirroring `Sensor`'s design — `write(value)`/`take() -> Option<value>`, last-write-wins, no queue. Doesn't know about `DynamicModel`/`Valve`/`Agitator`; consuming a command is the model's own responsibility.
 - **`sensor::model`** — `Sensor` reads `CurrentState` via `ReadProxy` and applies a pluggable `SensorBehavior`: `Ideal` (no transformation), `Noisy` (Gaussian noise), `Hysteresis` (dead band).
 - **`disturbance::cubic`** — `DisturbanceChannel`: piecewise cubic polynomial, continuously regenerated, with C¹ continuity (value and derivative) at the joints — produces a smooth random signal.
 - **`snapshot`** — `Snapshot::from_file` flattens any TOML file into `"dotted.path" -> f64`, without knowing what each key means; each component fetches only the keys it cares about during its own construction.
 
 ### `Simulation`
 
-A builder until `run()` is called (`set_model`, `set_adapter`, `add_sensor`, `add_actuator` only store definitions). `run()` spawns up to two supervised threads — the "plant thread" and the "adapter thread" — which only communicate via `SnapshotBus` (read) and `CommandQueue` (write), never directly through `StateRegistry` (which isn't `Send`). Each thread reports exactly one `ServiceEvent` (`Stopped`/`Failed`/`Panicked`, the latter via `catch_unwind`) before exiting; `run()` returns as soon as the first one dies.
+A builder until `run()` is called (`set_model`, `set_adapter`, `add_sensor`, `add_actuator` only store definitions). `run()` spawns up to two supervised threads — the "plant thread" and the "adapter thread" — which communicate with no bridge object at all: `Sensor` (read) and `Actuator` (write) are both `Send + Sync` and are exported once, via `Arc`, in a boot handshake — never directly through `StateRegistry` (which isn't `Send`). Each thread reports exactly one `ServiceEvent` (`Stopped`/`Failed`/`Panicked`, the latter via `catch_unwind`) before exiting; `run()` returns as soon as the first one dies.
 
 ### Adapters (`opcua` feature)
 
@@ -135,10 +136,10 @@ For a richer, real-world example (composition of several subsystems, initial con
 
 ## Cargo Features
 
-| Feature | Default | What it enables |
-|---|---|---|
-| *(none)* | — | Core: `DynamicModel`, `StateRegistry`, `NumericalMethod`/RK4, actuator/sensor/disturbance, `Snapshot`, `IoImage`. Only depends on `rand`/`rand_distr`/`toml`. |
-| `opcua` | off | Adds `adapter::opcua` — pulls in `async-opcua` + `tokio` (dependencies too heavy to be the default for a generic simulation framework). |
+| Feature  | Default | What it enables                                                                                                                                    |
+| -------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| *(none)* | —       | Core: `DynamicModel`, `StateRegistry`, `NumericalMethod`/RK4, actuator/sensor/disturbance, `Snapshot`. Only depends on `rand`/`rand_distr`/`toml`. |
+| `opcua`  | off     | Adds `adapter::opcua` — pulls in `async-opcua` + `tokio` (dependencies too heavy to be the default for a generic simulation framework).            |
 
 ```bash
 cargo build                  # core, no networking
