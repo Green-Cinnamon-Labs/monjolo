@@ -5,10 +5,9 @@ pub mod rk4;
 use integrator::Integrator;
 use rk4::RK4;
 
-/** Os métodos numéricos que `Simulation::set_numerical_method()` aceita —
-um enum fechado, não um `Box<dyn Integrator>` aberto de fora: só tolera o
-que o framework já implementa aqui dentro (hoje só `RK4`), nunca uma
-implementação arbitrária de quem consome o framework.
+/** Os métodos numéricos que `Simulation::set_numerical_method()` aceita — um enum fechado, não um
+`Box<dyn Integrator>` aberto de fora: só tolera o que o framework já implementa aqui dentro (hoje só
+`RK4`), nunca uma implementação arbitrária de quem consome o framework.
 */
 #[derive(Debug, Clone, Copy)]
 pub enum NumericalMethod {

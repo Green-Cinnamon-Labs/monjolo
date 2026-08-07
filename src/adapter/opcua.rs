@@ -1,31 +1,27 @@
-// src/adapter/opcua.rs
-//
-// Adaptador OPC-UA genérico: expõe sensores/atuadores via um servidor
-// OPC-UA mínimo. Não sabe nada de TEP/química/planta específica, nem de
-// `Simulation`/`StateRegistry` — só recebe um catálogo de `Arc<Sensor>`
-// (leitura) e um catálogo de `Arc<Actuator>` (escrita), ambos por nome, que
-// a "Thread da planta" já resolveu. Quem chama essa função é
-// `Simulation::run()`, nunca o usuário do framework direto.
-//
-// Requer a feature `opcua` — puxa async-opcua + tokio, pesados demais pra
-// serem dependência default do resto do crate.
-//
-// Sensores viram nodes read-only, atualizados por push (`set_values`) a
-// cada tick, chamando `sensor.read()` direto em cada `Arc<Sensor>` — o
-// mesmo objeto que a Thread da planta construiu, compartilhado (não
-// copiado) via o handshake de boot (`ready_tx`, ver simulation.rs). Não
-// existe bridge de leitura nenhuma: `Sensor::read()` já garante, sozinho,
-// que duas leituras dentro da mesma `generation` de `CurrentState`
-// devolvem o mesmo valor — não há nada pra "publicar" antecipadamente.
-//
-// Atuadores viram nodes writable com um `add_write_callback` de verdade —
-// esse callback é `Fn(...) + Send + Sync + 'static` (exigência do
-// SimpleNodeManager) e escreve direto no `Arc<Actuator>` daquele node
-// específico (também Send+Sync de verdade) — sem LocalSet/spawn_local, sem
-// bridge de escrita nenhuma: nada aqui é !Send, então roda de graça em
-// `tokio::spawn` comum, independente do runtime rodar em current_thread ou
-// multi_thread (ver simulation.rs, `spawn_adapter_thread` — current_thread:
-// sem trabalho paralelo real a justificar um pool de worker threads).
+/** src/adapter/opcua.rs
+
+Adaptador OPC-UA genérico: expõe sensores/atuadores via um servidor OPC-UA mínimo. Não sabe nada de
+TEP/química/planta específica, nem de `Simulation`/`StateRegistry` — só recebe um catálogo de
+`Arc<Sensor>` (leitura) e um catálogo de `Arc<Actuator>` (escrita), ambos por nome, que a "Thread da
+planta" já resolveu. Quem chama essa função é `Simulation::run()`, nunca o usuário do framework
+direto.
+
+Requer a feature `opcua` — puxa async-opcua + tokio, pesados demais pra serem dependência default do
+resto do crate.
+
+Sensores viram nodes read-only, atualizados por push (`set_values`) a cada tick, chamando
+`sensor.read()` direto em cada `Arc<Sensor>` — o mesmo objeto que a Thread da planta construiu,
+compartilhado (não copiado) via o handshake de boot (`ready_tx`, ver simulation.rs). Não existe
+bridge de leitura nenhuma: `Sensor::read()` já garante, sozinho, que duas leituras dentro da mesma
+`generation` de `CurrentState` devolvem o mesmo valor — não há nada pra "publicar" antecipadamente.
+
+Atuadores viram nodes writable com um `add_write_callback` de verdade — esse callback é `Fn(...) +
+Send + Sync + 'static` (exigência do SimpleNodeManager) e escreve direto no `Arc<Actuator>` daquele
+node específico (também Send+Sync de verdade) — sem LocalSet/spawn_local, sem bridge de escrita
+nenhuma: nada aqui é !Send, então roda de graça em `tokio::spawn` comum, independente do runtime
+rodar em current_thread ou multi_thread (ver simulation.rs, `spawn_adapter_thread` — current_thread:
+sem trabalho paralelo real a justificar um pool de worker threads).
+*/
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,16 +39,13 @@ use crate::sensor::model::Sensor;
 
 const NAMESPACE_URI: &str = "urn:monjolo:opcua-adapter";
 
-/** Sobe um servidor OPC-UA: um node read-only por sensor em `sensors`
-(lido via `sensor.read()` a cada tick — já passa pelo `SensorBehavior` do
-próprio sensor), um node writable por sensor em `actuators` (escrita
-empurrada direto no `Arc<Actuator>` daquele node, via `actuator.write()`).
+/** Sobe um servidor OPC-UA: um node read-only por sensor em `sensors` (lido via `sensor.read()` a
+cada tick — já passa pelo `SensorBehavior` do próprio sensor), um node writable por sensor em
+`actuators` (escrita empurrada direto no `Arc<Actuator>` daquele node, via `actuator.write()`).
 
-`endpoint` no formato `opc.tcp://<host>:<porta><path>`, ex.:
-`"opc.tcp://0.0.0.0:4840/tep/server/"`.
+`endpoint` no formato `opc.tcp://<host>:<porta><path>`, ex.: `"opc.tcp://0.0.0.0:4840/tep/server/"`.
 
-Bloqueia até o servidor encerrar (erro fatal — não há shutdown gracioso
-ainda).
+Bloqueia até o servidor encerrar (erro fatal — não há shutdown gracioso ainda).
 */
 pub async fn serve(
     sensors: HashMap<String, Arc<Sensor>>,

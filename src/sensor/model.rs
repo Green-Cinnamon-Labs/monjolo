@@ -1,15 +1,14 @@
-// sensor/model.rs
-//
-// Implementação concreta de `Sensor` (o trait de `sensor/mod.rs`) — bloco
-// genérico e reaproveitável do framework: ruído, histerese e cache de
-// idempotência não têm nada de específico do TEP, qualquer planta montada
-// sobre `monjolo` pode usar isso.
-//
-// `Sensor` não participa de evaluate()/EvaluationState, não é DynamicModel.
-// Lê CurrentState via um ReadProxy resolvido uma vez na construção — nunca
-// faz lookup por string no caminho quente de leitura. Agnóstico ao que o
-// sinal significa (vazão, pressão, temperatura...) — isso é metadado de
-// quem declara o sensor, não parte do tipo.
+/** sensor/model.rs
+
+Implementação concreta de `Sensor` (o trait de `sensor/mod.rs`) — bloco genérico e reaproveitável do
+framework: ruído, histerese e cache de idempotência não têm nada de específico do TEP, qualquer
+planta montada sobre `monjolo` pode usar isso.
+
+`Sensor` não participa de evaluate()/EvaluationState, não é DynamicModel. Lê CurrentState via um
+ReadProxy resolvido uma vez na construção — nunca faz lookup por string no caminho quente de
+leitura. Agnóstico ao que o sinal significa (vazão, pressão, temperatura...) — isso é metadado de
+quem declara o sensor, não parte do tipo.
+*/
 
 use std::sync::Mutex;
 
@@ -19,21 +18,19 @@ use rand_distr::{Distribution, Normal};
 
 use crate::state_registry::{ReadProxy, StateRegistry};
 
-/** O que acontece entre o valor bruto lido do registry e o valor devolvido
-pelo sensor. Pode ter estado interno (ex.: última leitura, para
-histerese/ruído) sem que isso implique dinâmica integrada — esse estado
-não entra no vetor que o `Integrator` avança, só é atualizado como efeito
-colateral de cada leitura.
+/** O que acontece entre o valor bruto lido do registry e o valor devolvido pelo sensor. Pode ter
+estado interno (ex.: última leitura, para histerese/ruído) sem que isso implique dinâmica integrada
+— esse estado não entra no vetor que o `Integrator` avança, só é atualizado como efeito colateral de
+cada leitura.
 */
 pub trait SensorBehavior: Send {
     fn apply(&mut self, physical_value: f64) -> f64;
 }
 
-/** Sensor: acompanha uma única chave do `StateRegistry`, sempre em
-`CurrentState` — nunca em `EvaluationState`, nunca um valor hipotético de
-sub-passo do integrador. Um pipe de leitura: lê o valor bruto confirmado via
-`ReadProxy` e aplica um `SensorBehavior` (ideal, ruído, histerese, ...) antes
-de expor. `Send + Sync`: compartilhável via `Arc<Sensor>` entre threads.
+/** Sensor: acompanha uma única chave do `StateRegistry`, sempre em `CurrentState` — nunca em
+`EvaluationState`, nunca um valor hipotético de sub-passo do integrador. Um pipe de leitura: lê o
+valor bruto confirmado via `ReadProxy` e aplica um `SensorBehavior` (ideal, ruído, histerese, ...)
+antes de expor. `Send + Sync`: compartilhável via `Arc<Sensor>` entre threads.
 */
 pub struct Sensor {
     proxy: ReadProxy,
@@ -42,18 +39,16 @@ pub struct Sensor {
 
 struct SensorInner {
     behavior: Box<dyn SensorBehavior>,
-    /** `(generation do CurrentState em que este valor foi calculado, valor
-    já processado)` — cache de idempotência: garante que
-    `SensorBehavior::apply()` só avança (amostra ruído, reavalia histerese)
-    uma vez por `commit()`, não uma vez por chamada de leitura.
+    /** `(generation do CurrentState em que este valor foi calculado, valor já processado)` — cache
+    de idempotência: garante que `SensorBehavior::apply()` só avança (amostra ruído, reavalia
+    histerese) uma vez por `commit()`, não uma vez por chamada de leitura.
     */
     cached: Option<(u64, f64)>,
 }
 
 impl Sensor {
-    /** Erra se `key` ainda não existir em `CurrentState` — sinal de que
-    `Sensor::new()` foi chamado cedo demais (antes do `resolve()` geral) ou
-    de que nenhum componente oferece esse nome.
+    /** Erra se `key` ainda não existir em `CurrentState` — sinal de que `Sensor::new()` foi chamado
+    cedo demais (antes do `resolve()` geral) ou de que nenhum componente oferece esse nome.
     */
     pub fn new(
         registry: &StateRegistry,
@@ -74,12 +69,11 @@ impl Sensor {
 }
 
 impl super::Sensor for Sensor {
-    /** Lê o valor confirmado (nunca hipotético) e aplica o `SensorBehavior`
-    — idempotente dentro da mesma `generation` de `CurrentState`: a primeira
-    chamada depois de um `commit()` invoca `SensorBehavior::apply()` de
-    verdade e guarda o resultado; qualquer chamada seguinte — de qualquer
-    consumidor, de qualquer thread — antes do próximo `commit()`, só devolve
-    o valor já cacheado.
+    /** Lê o valor confirmado (nunca hipotético) e aplica o `SensorBehavior` — idempotente dentro da
+    mesma `generation` de `CurrentState`: a primeira chamada depois de um `commit()` invoca
+    `SensorBehavior::apply()` de verdade e guarda o resultado; qualquer chamada seguinte — de
+    qualquer consumidor, de qualquer thread — antes do próximo `commit()`, só devolve o valor já
+    cacheado.
     */
     fn read(&self) -> f64 {
         let (generation, raw) = self.proxy.get_versioned();
@@ -95,7 +89,7 @@ impl super::Sensor for Sensor {
     }
 }
 
-// ── Ideal — sem transformação ─────────────────────────────────────────────────
+/* ── Ideal — sem transformação ── */
 
 pub struct Ideal;
 
@@ -105,7 +99,7 @@ impl SensorBehavior for Ideal {
     }
 }
 
-// ── Noisy — ruído gaussiano ────────────────────────────────────────────────────
+/* ── Noisy — ruído gaussiano ── */
 
 pub struct Noisy {
     std_dev: f64,
@@ -131,7 +125,7 @@ impl SensorBehavior for Noisy {
     }
 }
 
-// ── Hysteresis — banda morta em torno da última leitura ────────────────────────
+/* ── Hysteresis — banda morta em torno da última leitura ── */
 
 pub struct Hysteresis {
     deadband: f64,

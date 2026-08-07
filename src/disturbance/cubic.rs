@@ -1,43 +1,43 @@
-/** ## State of a single cubic disturbance channel.
+/** State of a single cubic disturbance channel.
 
- A disturbance is modeled as a piecewise cubic polynomial that is
- continuously regenerated over time, producing a smooth random signal.
+A disturbance is modeled as a piecewise cubic polynomial that is continuously regenerated over time,
+producing a smooth random signal.
 
- The polynomial for a channel is:
-   f(t) = a + h*(b + h*(c + h*d))   where h = t - t_last
+The polynomial for a channel is: f(t) = a + h*(b + h*(c + h*d))   where h = t - t_last
 
- When `t >= t_next`, a new segment is computed by `update_segment`,
- ensuring C1 continuity (value and first derivative match at joints).
+When `t >= t_next`, a new segment is computed by `update_segment`, ensuring C1 continuity (value and
+first derivative match at joints).
 */
 #[derive(Debug, Clone)]
 pub struct DisturbanceChannel {
-    /// Cubic polynomial coefficients for the current segment
+    /* Cubic polynomial coefficients for the current segment */
     pub a: f64,
     pub b: f64,
     pub c: f64,
     pub d: f64,
 
-    /// Time at which the current segment started
+    /* Time at which the current segment started */
     pub t_last: f64,
-    /// Time at which the current segment ends
+    /* Time at which the current segment ends */
     pub t_next: f64,
 
-    /// Shape parameters that control segment duration
+    /* Shape parameters that control segment duration */
     pub h_span: f64,
     pub h_zero: f64,
 
-    /// Shape parameters that control signal amplitude
+    /* Shape parameters that control signal amplitude */
     pub s_span: f64,
     pub s_zero: f64,
     pub sp_span: f64,
 
-    /// Whether this channel is active (0 = off, 1 = on)
+    /* Whether this channel is active (0 = off, 1 = on) */
     pub active: i32,
 }
 
 impl DisturbanceChannel {
-    /// Create a new channel with given shape parameters.
-    /// The polynomial is initialized flat at `s_zero`.
+    /** Create a new channel with given shape parameters. The polynomial is initialized flat at
+    `s_zero`.
+    */
     pub fn new(h_span: f64, h_zero: f64, s_span: f64, s_zero: f64, sp_span: f64) -> Self {
         Self {
             a: s_zero,
@@ -56,14 +56,13 @@ impl DisturbanceChannel {
     }
 }
 
-/**
- State for a collection of cubic disturbance channels plus the shared pseudo-random number generator seed.
+/** State for a collection of cubic disturbance channels plus the shared pseudo-random number
+generator seed.
 
- This struct is generic — it holds only the mechanism.
- Callers are responsible for initializing channels with the
- correct shape parameters for their application.
+This struct is generic — it holds only the mechanism. Callers are responsible for initializing
+channels with the correct shape parameters for their application.
 
- Equivalent to COMMON /WLK/ + COMMON /RANDSD/ in teprob.f
+Equivalent to COMMON /WLK/ + COMMON /RANDSD/ in teprob.f
 */
 #[derive(Debug, Clone)]
 pub struct CubicDisturbanceState {
@@ -72,7 +71,7 @@ pub struct CubicDisturbanceState {
 }
 
 impl CubicDisturbanceState {
-    /// Create a new state with pre-built channels and a given seed.
+    /* Create a new state with pre-built channels and a given seed. */
     pub fn new(channels: Vec<DisturbanceChannel>, rand_seed: f64) -> Self {
         Self {
             channels,
@@ -81,11 +80,10 @@ impl CubicDisturbanceState {
     }
 }
 
-// =============== Core functions (TESUB5–8) ===============
+/* ── Core functions (TESUB5–8) ── */
 
-/** ## Evaluate the cubic disturbance polynomial for channel `idx` at time `t`.
- f(t) = a + h*(b + h*(c + h*d))   where h = t - t_last
- Direct translation of TESUB8 from teprob.f
+/** Evaluate the cubic disturbance polynomial for channel `idx` at time `t`. f(t) = a + h*(b + h*(c
++ h*d))   where h = t - t_last. Direct translation of TESUB8 from teprob.f
 */
 pub fn eval_disturbance(idx: usize, time: f64, state: &CubicDisturbanceState) -> f64 {
     let ch = &state.channels[idx];
@@ -93,13 +91,9 @@ pub fn eval_disturbance(idx: usize, time: f64, state: &CubicDisturbanceState) ->
     ch.a + h * (ch.b + h * (ch.c + h * ch.d))
 }
 
-/** ## Update the cubic polynomial segment for channel `idx`.
-
- Generates a new C1-continuous cubic segment from the current
- position `(s, sp)` to a randomly chosen future point.
- Updates `a`, `b`, `c`, `d`, and `t_next` in place.
-
- Direct translation of SUBROUTINE TESUB5 from teprob.f
+/** Update the cubic polynomial segment for channel `idx`. Generates a new C1-continuous cubic
+segment from the current position `(s, sp)` to a randomly chosen future point. Updates `a`, `b`,
+`c`, `d`, and `t_next` in place. Direct translation of SUBROUTINE TESUB5 from teprob.f
 */
 pub fn update_segment(idx: usize, s: f64, sp: f64, state: &mut CubicDisturbanceState) {
     let h = state.channels[idx].h_span * lcg_rand(-1, state) + state.channels[idx].h_zero;
@@ -115,25 +109,18 @@ pub fn update_segment(idx: usize, s: f64, sp: f64, state: &mut CubicDisturbanceS
     ch.t_next = ch.t_last + h;
 }
 
-/** ## Generate approximate Gaussian white noise with standard deviation `std`.
-
- Uses the Irwin-Hall method: sum of 12 uniform samples minus 6,
- scaled by `std`. Approximates N(0, std²) by the Central Limit Theorem.
-
- Direct translation of SUBROUTINE TESUB6 from teprob.f
+/** Generate approximate Gaussian white noise with standard deviation `std`. Uses the Irwin-Hall
+method: sum of 12 uniform samples minus 6, scaled by `std`. Approximates N(0, std²) by the Central
+Limit Theorem. Direct translation of SUBROUTINE TESUB6 from teprob.f
 */
 pub fn white_noise(std: f64, state: &mut CubicDisturbanceState) -> f64 {
     let sum: f64 = (0..12).map(|_| lcg_rand(0, state)).sum();
     (sum - 6.0) * std
 }
 
-/** ## Linear congruential pseudo-random number generator.
-
- Identical to the generator in TESUB7 from teprob.f.
- Mutates `rand_seed` in `state` on every call.
-
- `i >= 0` → returns value in [0, 1)
- `i <  0` → returns value in [-1, 1)
+/** Linear congruential pseudo-random number generator. Identical to the generator in TESUB7 from
+teprob.f. Mutates `rand_seed` in `state` on every call. `i >= 0` → returns value in [0, 1); `i < 0`
+→ returns value in [-1, 1).
 */
 pub fn lcg_rand(i: i32, state: &mut CubicDisturbanceState) -> f64 {
     const MOD: f64 = 4_294_967_296.0;

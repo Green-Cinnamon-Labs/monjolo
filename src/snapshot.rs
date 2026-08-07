@@ -1,19 +1,17 @@
-// snapshot.rs
-//
-// Carrega um TOML qualquer num mapa achatado `"caminho.pontuado" -> f64` —
-// não sabe nada de TEP, de Reactor, de qual chave significa o quê. Cada
-// tabela aninhada do TOML vira um prefixo de chave (`[state.reactor_vapor]
-// A = 1.0` vira `"state.reactor_vapor.A" -> 1.0`); valores não-numéricos
-// (string, bool, array, o `[meta]` de descrição etc.) são ignorados — não
-// são estado.
-//
-// Substitui a ideia antiga de um struct rígido por seção (tep-plant tinha
-// um `InitialState`/`StateSections` batendo campo a campo com o TOML) — em
-// vez disso, quem quer inicializar um componente (ex.: `Reactor::new()`)
-// recebe um `&Snapshot` e busca só as chaves que interessam pra ele, do
-// mesmo jeito que já faz com `StateRegistry` por nome. Um "snapshot" nesse
-// sentido é literalmente o que `StateRegistry::snapshot()` já produz em
-// memória — este módulo só resolve o lado de ler isso de um arquivo.
+/** snapshot.rs
+
+Carrega um TOML qualquer num mapa achatado `"caminho.pontuado" -> f64` — não sabe nada de TEP, de
+Reactor, de qual chave significa o quê. Cada tabela aninhada do TOML vira um prefixo de chave
+(`[state.reactor_vapor] A = 1.0` vira `"state.reactor_vapor.A" -> 1.0`); valores não-numéricos
+(string, bool, array, o `[meta]` de descrição etc.) são ignorados — não são estado.
+
+Substitui a ideia antiga de um struct rígido por seção (tep-plant tinha um
+`InitialState`/`StateSections` batendo campo a campo com o TOML) — em vez disso, quem quer
+inicializar um componente (ex.: `Reactor::new()`) recebe um `&Snapshot` e busca só as chaves que
+interessam pra ele, do mesmo jeito que já faz com `StateRegistry` por nome. Um "snapshot" nesse
+sentido é literalmente o que `StateRegistry::snapshot()` já produz em memória — este módulo só
+resolve o lado de ler isso de um arquivo.
+*/
 
 use std::collections::HashMap;
 
@@ -22,9 +20,9 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Carrega e achata um arquivo TOML. `Err` se o arquivo não existir ou
-    /// não for TOML válido — não valida nada sobre o *conteúdo* (isso é
-    /// problema de quem consome, via `get()`).
+    /** Carrega e achata um arquivo TOML. `Err` se o arquivo não existir ou não for TOML válido —
+    não valida nada sobre o *conteúdo* (isso é problema de quem consome, via `get()`).
+    */
     pub fn from_file(path: &str) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Erro lendo arquivo '{path}': {e}"))?;
@@ -36,16 +34,18 @@ impl Snapshot {
         Ok(Self { values })
     }
 
-    /// Constrói direto de pares já resolvidos — útil pra teste, sem
-    /// precisar de um arquivo real no disco.
+    /* Constrói direto de pares já resolvidos — útil pra teste, sem precisar de um arquivo real no
+    disco.
+    */
     pub fn from_pairs(pairs: &[(&str, f64)]) -> Self {
         Self {
             values: pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
         }
     }
 
-    /// Lê o valor de uma chave achatada (ex.: `"state.reactor_vapor.A"`).
-    /// `None` se a chave não existir ou não for numérica no TOML original.
+    /* Lê o valor de uma chave achatada (ex.: `"state.reactor_vapor.A"`). `None` se a chave não
+    existir ou não for numérica no TOML original.
+    */
     pub fn get(&self, key: &str) -> Option<f64> {
         self.values.get(key).copied()
     }
@@ -69,7 +69,7 @@ fn flatten(value: &toml::Value, prefix: String, out: &mut HashMap<String, f64>) 
         toml::Value::Integer(i) => {
             out.insert(prefix, *i as f64);
         }
-        // String, Boolean, Array, Datetime: não são estado numérico, ignorados.
+        /* String, Boolean, Array, Datetime: não são estado numérico, ignorados. */
         _ => {}
     }
 }
