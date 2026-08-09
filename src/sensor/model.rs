@@ -5,7 +5,8 @@ framework: ruído, histerese e cache de idempotência não têm nada de específ
 planta montada sobre `monjolo` pode usar isso.
 
 `Sensor` não participa de evaluate()/EvaluationState, não é DynamicModel. Lê CurrentState via um
-ReadProxy resolvido uma vez na construção — nunca faz lookup por string no caminho quente de
+ReadProxy declarado na construção (`StateRegistry::subscribe_read()`) e resolvido depois, junto com
+tudo mais, por `StateRegistry::resolve()` — nunca faz lookup por string no caminho quente de
 leitura. Agnóstico ao que o sinal significa (vazão, pressão, temperatura...) — isso é metadado de
 quem declara o sensor, não parte do tipo.
 */
@@ -47,24 +48,20 @@ struct SensorInner {
 }
 
 impl Sensor {
-    /** Erra se `key` ainda não existir em `CurrentState` — sinal de que `Sensor::new()` foi chamado
-    cedo demais (antes do `resolve()` geral) ou de que nenhum componente oferece esse nome.
+    /** Declara a necessidade da chave `key` via `StateRegistry::subscribe_read()` — mesmo ciclo
+    declare → register → resolve → inject de qualquer outro `need` (Art. 6.3/7.1): não erra mais na
+    hora, só quando `StateRegistry::resolve()` rodar e não encontrar provedor pra `key`. Pode ser
+    chamado em qualquer ordem em relação a quem oferece essa chave — inclusive antes.
     */
-    pub fn new(
-        registry: &StateRegistry,
-        key: &str,
-        behavior: Box<dyn SensorBehavior>,
-    ) -> Result<Self, String> {
-        let proxy = registry.read_proxy(key).ok_or_else(|| format!(
-            "Sensor: chave '{key}' não existe em CurrentState — StateRegistry::resolve() já rodou e nenhum componente oferece esse slot?"
-        ))?;
-        Ok(Self {
+    pub fn new(registry: &mut StateRegistry, key: &str, behavior: Box<dyn SensorBehavior>) -> Self {
+        let proxy = registry.subscribe_read(&[key]).remove(0);
+        Self {
             proxy,
             inner: Mutex::new(SensorInner {
                 behavior,
                 cached: None,
             }),
-        })
+        }
     }
 }
 
@@ -175,18 +172,18 @@ mod tests {
         let registry = StateRegistry::shared();
         let (offered, _) = registry.borrow_mut().subscribe(&["reactor.temperature"], &[]);
         offered[0].set(120.5);
-        registry.borrow_mut().resolve().unwrap();
-        registry.borrow_mut().commit();
 
         let calls = Arc::new(AtomicUsize::new(0));
         let sensor = Sensor::new(
-            &registry.borrow(),
+            &mut registry.borrow_mut(),
             "reactor.temperature",
             Box::new(CountingBehavior {
                 calls: calls.clone(),
             }),
-        )
-        .unwrap();
+        );
+
+        registry.borrow_mut().resolve().unwrap();
+        registry.borrow_mut().commit();
 
         assert_eq!(sensor.read(), 120.5);
         assert_eq!(sensor.read(), 120.5);
@@ -197,6 +194,26 @@ mod tests {
 
         assert_eq!(sensor.read(), 121.0);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /** O ponto real desta mudança: `Sensor::new()` declara o `need` antes mesmo do componente que
+    oferece a chave ter se inscrito — a ordem entre quem pede e quem oferece nunca importou pra
+    `Proxy` (Art. 6.3), e agora também não importa mais pra `Sensor`/`ReadProxy`. Art. 3.8's antiga
+    proibição (Sensor só depois do resolve() geral) não se aplica mais.
+    */
+    #[test]
+    fn sensor_can_be_declared_before_its_key_is_offered() {
+        let registry = StateRegistry::shared();
+
+        let sensor = Sensor::new(&mut registry.borrow_mut(), "reactor.pressure", Box::new(Ideal));
+
+        let (offered, _) = registry.borrow_mut().subscribe(&["reactor.pressure"], &[]);
+        offered[0].set(2705.0);
+
+        registry.borrow_mut().resolve().unwrap();
+        registry.borrow_mut().commit();
+
+        assert_eq!(sensor.read(), 2705.0);
     }
 
     #[test]
