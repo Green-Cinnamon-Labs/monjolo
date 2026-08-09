@@ -1,13 +1,14 @@
-/** Contrato mínimo de escrita — a contraparte de `Sensor` (`sensor/mod.rs`). Quem implementa isso
-recebe comandos de fora; `monjolo` não sabe nada sobre o que acontece com o valor escrito (pode
-virar `command` de um `Valve` com defasagem de 1ª ordem, pode ser ignorado, pode alimentar outra
-coisa qualquer — decisão de quem implementa).
+/** Contrato mínimo de escrita — a contraparte de `Sensor` (`sensor/mod.rs`). A implementação
+concreta genérica (`model`) mora aqui mesmo: um atuador de estado único com dinâmica de 1ª ordem
+arbitrária, fornecida por quem constrói via closure — não há nada de específico de planta nenhuma
+aqui, e não há mais um tipo Rust por atuador físico (`tep-plant` não declara mais `struct FeedDValve`
+etc.: cada válvula é só uma instância de `actuator::model::Actuator` com sua própria chave/lei).
 
 Um `DynamicModel` pode perfeitamente também implementar `Actuator` — não há conflito: são dois
-traits distintos, um componente físico (`Valve`, `Agitator`) pode ser as duas coisas ao mesmo tempo
-(ver CONTRIBUTING.md, discussão sobre Valve/Agitator serem atuadores de verdade, não só uma caixa de
-correio separada).
+traits distintos sobre o mesmo objeto (é exatamente o que `actuator::model::Actuator` faz).
 */
 pub trait Actuator {
     fn write(&self, value: f64);
 }
+
+pub mod model;
