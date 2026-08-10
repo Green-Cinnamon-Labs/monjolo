@@ -12,6 +12,8 @@ derivada": um DynamicModel sem derivada nenhuma (ex.: um agregador puro) ainda �
 integração, porque os valores que ele lê mudam a cada rodada — só não é ele quem o Integrator soma
 no vetor de estado.
 */
+use std::rc::Rc;
+
 pub trait DynamicModel {
     /** `&str`, não `&'static str`: precisa poder apontar pra um nome guardado dentro de `self`
     (ex.: `Composite::named()`), não só um literal fixo no código.
@@ -121,5 +123,27 @@ impl CompositeDynamicModel for Composite {
 
     fn models_mut(&mut self) -> &mut Vec<Box<dyn DynamicModel>> {
         &mut self.models
+    }
+}
+
+/** Deixa um `Rc<T>` ser `add_dynamic`'d como qualquer outro `DynamicModel` — o caso que motiva isso
+é um `Actuator` (ou qualquer outro componente) que precisa ser a mesma instância tanto dentro do
+composto (`Box<dyn DynamicModel>`, participa de `evaluate()`) quanto fora dele, catalogado por nome
+(`StateRegistry::offer_actuator`, `Rc<dyn Actuator>`) — sem essa impl, as duas exigiriam cópias
+separadas, e um `Controller` que escreve na cópia catalogada nunca afetaria a física de verdade.
+`Rc<T>`, não `Arc<T>`: os componentes concretos deste framework já são `!Send` (`Proxy` é
+`Rc`-based), então `Arc` prometeria uma travessia de thread que não existe.
+*/
+impl<T: DynamicModel + ?Sized> DynamicModel for Rc<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn evaluate(&self) {
+        (**self).evaluate();
+    }
+
+    fn state_keys(&self) -> Vec<String> {
+        (**self).state_keys()
     }
 }

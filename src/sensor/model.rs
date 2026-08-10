@@ -11,7 +11,7 @@ leitura. Agnóstico ao que o sinal significa (vazão, pressão, temperatura...) 
 quem declara o sensor, não parte do tipo.
 */
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
@@ -52,16 +52,23 @@ impl Sensor {
     declare → register → resolve → inject de qualquer outro `need` (Art. 6.3/7.1): não erra mais na
     hora, só quando `StateRegistry::resolve()` rodar e não encontrar provedor pra `key`. Pode ser
     chamado em qualquer ordem em relação a quem oferece essa chave — inclusive antes.
+
+    Devolve `Arc<Self>`, não `Self`: "criado = já oferecido" é invariante do tipo, não etapa manual
+    de quem constrói — `new()` já registra o sensor no catálogo de `StateRegistry` sob a própria
+    `key` (`offer_sensor()`, `pub(crate)`) antes de devolver, e devolve o mesmo `Arc` que guardou
+    lá — não uma cópia.
     */
-    pub fn new(registry: &mut StateRegistry, key: &str, behavior: Box<dyn SensorBehavior>) -> Self {
+    pub fn new(registry: &mut StateRegistry, key: &str, behavior: Box<dyn SensorBehavior>) -> Arc<Self> {
         let proxy = registry.subscribe_read(&[key]).remove(0);
-        Self {
+        let sensor = Arc::new(Self {
             proxy,
             inner: Mutex::new(SensorInner {
                 behavior,
                 cached: None,
             }),
-        }
+        });
+        registry.offer_sensor(key, sensor.clone());
+        sensor
     }
 }
 
@@ -154,7 +161,6 @@ mod tests {
     use super::*;
     use crate::sensor::Sensor as SensorTrait;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     struct CountingBehavior {
         calls: Arc<AtomicUsize>,
@@ -214,6 +220,20 @@ mod tests {
         registry.borrow_mut().commit();
 
         assert_eq!(sensor.read(), 2705.0);
+    }
+
+    /** Prova a invariante nova: `Sensor::new()` já registra o sensor no catálogo de
+    `StateRegistry`, sob a própria `key` — ninguém precisa chamar `offer_sensor()` à parte, e nem
+    poderia (é `pub(crate)`).
+    */
+    #[test]
+    fn new_registers_itself_under_its_own_key() {
+        let registry = StateRegistry::shared();
+        let sensor = Sensor::new(&mut registry.borrow_mut(), "reactor.pressure", Box::new(Ideal));
+        let sensor: Arc<dyn SensorTrait> = sensor;
+
+        let found = registry.borrow().sensor("reactor.pressure").expect("deveria estar no catálogo");
+        assert!(Arc::ptr_eq(&sensor, &found));
     }
 
     #[test]

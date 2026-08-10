@@ -12,6 +12,7 @@ nesta instância.
 */
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use crate::dynamic_model::DynamicModel;
 use crate::state_registry::{Proxy, StateRegistry};
@@ -36,21 +37,29 @@ impl Actuator {
     /** `key` é a chave publicada no StateRegistry pro estado próprio (posição, velocidade, o que
     for); a derivada é sempre publicada como `"{key}.derivative"` — nunca precisa ser redeclarada.
     `dynamics(comando, estado) -> dx/dt` é a lei física, chamada uma vez por `evaluate()`.
+
+    Devolve `Rc<Self>`, não `Self`: "criado = já oferecido" é invariante do tipo — `new()` já
+    registra o atuador no catálogo de `StateRegistry` sob a própria `key` (`offer_actuator()`,
+    `pub(crate)`) antes de devolver, e devolve o mesmo `Rc` que guardou lá. Esse mesmo `Rc` também é
+    o que `add_dynamic` recebe (`Rc<T>: DynamicModel`) — a mesma instância participa da física e
+    fica endereçável por nome, sem cópia.
     */
     pub fn new(
         registry: &mut StateRegistry,
         key: &str,
         dynamics: impl Fn(f64, f64) -> f64 + 'static,
-    ) -> Self {
+    ) -> Rc<Self> {
         let derivative_key = format!("{key}.derivative");
         let (offered, _) = registry.subscribe(&[key, &derivative_key], &[]);
 
-        Self {
+        let actuator = Rc::new(Self {
             command: Cell::new(0.0),
             state: offered[0].clone(),
             derivative: offered[1].clone(),
             dynamics: Box::new(dynamics),
-        }
+        });
+        registry.offer_actuator(key, actuator.clone());
+        actuator
     }
 }
 
@@ -101,5 +110,21 @@ mod tests {
         actuator.write(3.0);
         actuator.evaluate();
         assert_eq!(actuator.derivative.get(), 9.0);
+    }
+
+    /** Prova a invariante nova: `Actuator::new()` já registra o atuador no catálogo de
+    `StateRegistry`, sob a própria `key` — ninguém precisa chamar `offer_actuator()` à parte, e nem
+    poderia (é `pub(crate)`).
+    */
+    #[test]
+    fn new_registers_itself_under_its_own_key() {
+        let registry = StateRegistry::shared();
+        let actuator = Actuator::new(&mut registry.borrow_mut(), "purge", |command, state| {
+            command - state
+        });
+        let actuator: Rc<dyn ActuatorTrait> = actuator;
+
+        let found = registry.borrow().actuator("purge").expect("deveria estar no catálogo");
+        assert!(Rc::ptr_eq(&actuator, &found));
     }
 }
