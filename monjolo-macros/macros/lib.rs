@@ -241,18 +241,26 @@ pub fn sensor(attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/** `#[controller(name = "...", sensors = ["..."], actuators = ["..."])]` — embrulha
-`controller::model::Controller::new()`, que já resolve os nomes de Sensor/Actuator declarados via
-`need_sensor()`/`need_actuator()` (ordem-independente, Art. 6.3). Não inventa lógica de controle
-nenhuma — `impl DynamicModel for Controller` (com `evaluate()` vazio) mora em
-`monjolo::controller::model`, não aqui: um único `impl`, escrito à mão, cobre todo Controller,
-macro ou não (ver o comentário lá pra explicar por quê não pode ser gerado por invocação daqui).
-`sensors`/`actuators` são opcionais — default `[]`, mesmo default de `Controller::new()`.
+/** `#[controller(name = "...")]` — mesmo padrão de `#[actuator(...)]`: a partir de uma struct com
+campos `#[sensor(key = "...")]`/`#[actuator(key = "...")]` e um `impl` com um método `control(&self)`
+escrito à mão em outro lugar, gera o wiring inteiro (`SensorHandle`/`ActuatorHandle`, `new()` que já
+resolve os nomes via `need_sensor()`/`need_actuator()` — ordem-independente, Art. 6.3 — e já se
+registra no catálogo via `offer_controller()`, `impl DynamicModel` chamando `control()`).
+
+Cada campo marcado vira um getter que devolve o HANDLE (`Arc<dyn Sensor>`/`Rc<dyn Actuator>`), não o
+valor já lido/escrito — mesma forma que `controller::model::Controller::sensor()`/`actuator()` já
+expõem à mão. `control()` decide sozinho quando `.read()`/`.write(valor)`; a lei de controle (Kp,
+setpoint, bias — o que for) fica inteiramente no método do usuário, nunca na macro — mesmo raciocínio
+de `tau` dentro de `dynamics()` em `#[actuator]`.
+
+Exige pelo menos um campo `#[sensor]` e um `#[actuator]` — um Controller sem nenhum dos dois não tem
+com o que interagir. Múltiplos de cada são permitidos (malhas com mais de uma medição/atuação); um
+campo não pode ser os dois ao mesmo tempo.
 */
 #[proc_macro_attribute]
 pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = match syn::parse::<ControllerArgs>(attr) {
-        Ok(args) => args,
+    let name = match parse_name_arg(attr) {
+        Ok(name) => name,
         Err(err) => return err.to_compile_error().into(),
     };
 
@@ -260,41 +268,112 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
     let struct_name = &input.ident;
     let visibility = &input.vis;
 
-    if !matches!(input.fields, Fields::Unit) {
-        return syn::Error::new_spanned(
-            &input,
-            "#[controller] só suporta struct sem campos (ex.: `struct ReactorPressureControl;`) — ainda não há lógica de controle própria do usuário, só nomes de Sensor/Actuator (Controller é open item, ver CONTRIBUTING.md)",
-        )
-        .to_compile_error()
-        .into();
+    let named_fields = match &input.fields {
+        Fields::Named(named) => &named.named,
+        _ => {
+            return syn::Error::new_spanned(
+                &input,
+                "#[controller] só suporta struct com campos nomeados (ex.: `struct ReactorPressureControl { #[sensor(key = \"reactor.pressure\")] pressure: f64, #[actuator(key = \"valve.purge.position\")] purge: f64 }`)",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    let mut sensor_idents = Vec::new();
+    let mut sensor_keys = Vec::new();
+    let mut actuator_idents = Vec::new();
+    let mut actuator_keys = Vec::new();
+
+    for field in named_fields {
+        let ident = field.ident.as_ref().expect("Fields::Named sempre tem ident");
+        let mut marked = false;
+        for field_attr in &field.attrs {
+            if field_attr.path().is_ident("sensor") {
+                if marked {
+                    return syn::Error::new_spanned(field_attr, "um campo só pode ser #[sensor] OU #[actuator], não os dois")
+                        .to_compile_error()
+                        .into();
+                }
+                let key = match parse_field_key(field_attr) {
+                    Ok(key) => key,
+                    Err(err) => return err.to_compile_error().into(),
+                };
+                sensor_idents.push(ident.clone());
+                sensor_keys.push(key);
+                marked = true;
+            } else if field_attr.path().is_ident("actuator") {
+                if marked {
+                    return syn::Error::new_spanned(field_attr, "um campo só pode ser #[sensor] OU #[actuator], não os dois")
+                        .to_compile_error()
+                        .into();
+                }
+                let key = match parse_field_key(field_attr) {
+                    Ok(key) => key,
+                    Err(err) => return err.to_compile_error().into(),
+                };
+                actuator_idents.push(ident.clone());
+                actuator_keys.push(key);
+                marked = true;
+            }
+        }
     }
 
-    let name = &args.name;
-    let sensors = &args.sensors;
-    let actuators = &args.actuators;
+    if sensor_idents.is_empty() {
+        return syn::Error::new_spanned(&input, "falta pelo menos um campo marcado #[sensor(key = \"...\")]")
+            .to_compile_error()
+            .into();
+    }
+    if actuator_idents.is_empty() {
+        return syn::Error::new_spanned(&input, "falta pelo menos um campo marcado #[actuator(key = \"...\")]")
+            .to_compile_error()
+            .into();
+    }
 
     let expanded = quote! {
-        #visibility struct #struct_name;
+        #visibility struct #struct_name {
+            #(#sensor_idents: ::monjolo::state_registry::SensorHandle,)*
+            #(#actuator_idents: ::monjolo::state_registry::ActuatorHandle,)*
+        }
 
         impl #struct_name {
-            /** Devolve o mesmo `Rc<Controller>` que o catálogo do StateRegistry guarda — mesma
-            invariante de `controller::model::Controller::new()` (que este `new()` só encapsula).
+            #(
+                pub fn #sensor_idents(&self) -> ::std::sync::Arc<dyn ::monjolo::sensor::Sensor> {
+                    self.#sensor_idents.sensor()
+                }
+            )*
+            #(
+                pub fn #actuator_idents(&self) -> ::std::rc::Rc<dyn ::monjolo::actuator::Actuator> {
+                    self.#actuator_idents.actuator()
+                }
+            )*
+
+            /** `new()` já registra o controller no catálogo do StateRegistry sob `name` — mesma
+            invariante de `controller::model::Controller::new()` ("criado = já oferecido").
             */
-            pub fn new(
-                registry: &mut ::monjolo::state_registry::StateRegistry,
-            ) -> ::std::rc::Rc<::monjolo::controller::model::Controller> {
-                ::monjolo::controller::model::Controller::new(
-                    registry,
-                    #name,
-                    &[#(#sensors),*],
-                    &[#(#actuators),*],
-                )
+            pub fn new(registry: &mut ::monjolo::state_registry::StateRegistry) -> ::std::rc::Rc<Self> {
+                #(let #sensor_idents = registry.need_sensor(#sensor_keys);)*
+                #(let #actuator_idents = registry.need_actuator(#actuator_keys);)*
+                let __instance = ::std::rc::Rc::new(Self {
+                    #(#sensor_idents,)*
+                    #(#actuator_idents,)*
+                });
+                registry.offer_controller(#name, __instance.clone());
+                __instance
             }
         }
 
+        impl ::monjolo::dynamic_model::DynamicModel for #struct_name {
+            fn evaluate(&self) {
+                self.control();
+            }
+        }
+
+        impl ::monjolo::controller::Controller for #struct_name {}
+
         /* Anúncio escondido pro bootstrap de Simulation — Controller É DynamicModel (fase C, ver
         monjolo::component), então construct() devolve Some: a mesma instância catalogada
-        (offer_controller, dentro de Controller::new()) entra na árvore de avaliação.
+        (offer_controller, dentro de new()) entra na árvore de avaliação.
         */
         ::monjolo::inventory::submit! {
             ::monjolo::ComponentDescriptor {
@@ -314,54 +393,33 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-struct ControllerArgs {
-    name: String,
-    sensors: Vec<String>,
-    actuators: Vec<String>,
+fn parse_name_arg(attr: TokenStream) -> syn::Result<String> {
+    let meta = syn::parse::<syn::MetaNameValue>(attr)?;
+    if !meta.path.is_ident("name") {
+        return Err(syn::Error::new_spanned(&meta.path, "esperado `name = \"...\"`"));
+    }
+    match &meta.value {
+        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(literal), .. }) => Ok(literal.value()),
+        other => Err(syn::Error::new_spanned(other, "`name` precisa ser uma string literal")),
+    }
 }
 
-impl syn::parse::Parse for ControllerArgs {
-    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let pairs = syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated(input)?;
-
-        let mut name = None;
-        let mut sensors = Vec::new();
-        let mut actuators = Vec::new();
-
-        for pair in &pairs {
-            if pair.path.is_ident("name") {
-                name = Some(expect_str_lit(&pair.value)?);
-            } else if pair.path.is_ident("sensors") {
-                sensors = expect_str_array(&pair.value)?;
-            } else if pair.path.is_ident("actuators") {
-                actuators = expect_str_array(&pair.value)?;
-            } else {
-                return Err(syn::Error::new_spanned(
-                    &pair.path,
-                    "esperado `name`, `sensors` ou `actuators`",
-                ));
-            }
-        }
-
-        let name = name.ok_or_else(|| {
-            syn::Error::new(proc_macro2::Span::call_site(), "falta `name = \"...\"`")
-        })?;
-
-        Ok(ControllerArgs { name, sensors, actuators })
+/* `#[sensor(key = "...")]`/`#[actuator(key = "...")]` — só esse único argumento, cada um (ao
+contrário de `#[need]`/`#[offer]` em `#[dynamic_model]`, que também aceitam `prefix`+`components`
+pra vetores: Sensor/Actuator são entradas escalares e nomeadas no catálogo, nunca um vetor).
+*/
+fn parse_field_key(attr: &syn::Attribute) -> syn::Result<String> {
+    let meta = attr.parse_args::<syn::MetaNameValue>()?;
+    if !meta.path.is_ident("key") {
+        return Err(syn::Error::new_spanned(&meta.path, "esperado `key = \"...\"`"));
     }
+    expect_str_lit(&meta.value)
 }
 
 fn expect_str_lit(expr: &syn::Expr) -> syn::Result<String> {
     match expr {
         syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(literal), .. }) => Ok(literal.value()),
         other => Err(syn::Error::new_spanned(other, "esperada uma string literal")),
-    }
-}
-
-fn expect_str_array(expr: &syn::Expr) -> syn::Result<Vec<String>> {
-    match expr {
-        syn::Expr::Array(array) => array.elems.iter().map(expect_str_lit).collect(),
-        other => Err(syn::Error::new_spanned(other, "esperado um array de strings, ex.: [\"a\", \"b\"]")),
     }
 }
 

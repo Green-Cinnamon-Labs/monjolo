@@ -237,13 +237,37 @@ mod tests {
         root.evaluate(); // avalia a árvore inteira, inclusive o componente descoberto — sem panic
     }
 
-    /* Depende do atuador descoberto pelo teste acima (mesma key) — prova que Controller entra na
-    fase (C), depois do Actuator (fase B), sem precisar de nenhuma ordem específica entre os dois
-    na hora de declarar (need_actuator é ordem-independente, mesma prova de
-    controller::model::model::tests::resolves_named_dependencies_declared_before_they_are_offered).
+    /* Sensor de teste real, na mesma chave que DiscoveredActuator já oferece como estado próprio
+    (`test.discovered.position`) — um Sensor nunca inventa seu próprio valor bruto, só lê e
+    transforma um que já existe (`Sensor::new()` chama `subscribe_read()`, contraparte só-leitura de
+    um `#[offer]`/`#[state]` já existente; ver sensor/model.rs). Prova o caminho inteiro pro lado de
+    leitura: macro → inventory::submit! escondido → attach_discovered_components() descobre →
+    StateRegistry cataloga (Sensor nunca entra em `root`, só cataloga — ver ComponentKind).
     */
-    #[monjolo_macros::controller(name = "test_controller", actuators = ["test.discovered.position"])]
-    struct TestController;
+    #[monjolo_macros::sensor(key = "test.discovered.position")]
+    struct DiscoveredSensor;
+
+    /* Depende do atuador/sensor descobertos pelos testes acima (mesma chave, "test.discovered.
+    position" — o sensor lê de volta a própria posição do atuador) — prova que Controller entra na
+    fase (C), depois do Actuator (fase B), sem precisar de nenhuma ordem específica entre eles na
+    hora de declarar (need_sensor/need_actuator são ordem-independentes, mesma prova de
+    controller::model::model::tests::resolves_named_dependencies_declared_before_they_are_offered) —
+    e que `control()` (não mais um `evaluate()` vazio) é de fato chamado e consegue ler o sensor e
+    escrever no atuador através dos getters gerados pela macro.
+    */
+    #[monjolo_macros::controller(name = "test_controller")]
+    struct TestController {
+        #[sensor(key = "test.discovered.position")]
+        reading: f64,
+        #[actuator(key = "test.discovered.position")]
+        position: f64,
+    }
+
+    impl TestController {
+        fn control(&self) {
+            self.position().write(self.reading().read() + 1.0);
+        }
+    }
 
     #[test]
     fn attach_discovered_components_finds_and_wires_a_real_macro_declared_controller() {
@@ -269,7 +293,7 @@ mod tests {
             mesma alocação",
         );
 
-        root.evaluate(); // avalia a árvore inteira, inclusive o controller (evaluate() vazio) — sem panic
+        root.evaluate(); // avalia a árvore inteira, inclusive control() (lê sensor, escreve atuador) — sem panic
     }
 
     /* Prova o mecanismo mais geral: campo escalar (#[state]+#[config]+#[offer]), campo array
