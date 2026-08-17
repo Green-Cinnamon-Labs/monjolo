@@ -39,8 +39,8 @@ pub fn dynamic_model(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 #[proc_macro_attribute]
 pub fn actuator(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let key = match parse_key_arg(attr) {
-        Ok(key) => key,
+    let ActuatorArgs { key, config } = match syn::parse::<ActuatorArgs>(attr) {
+        Ok(args) => args,
         Err(err) => return err.to_compile_error().into(),
     };
 
@@ -101,6 +101,17 @@ pub fn actuator(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    /* `config`: chave opcional do Snapshot pra semear o valor NOMINAL (command E state, os dois
+    iguais — dynamics() nasce em zero, nada deriva sozinho até algo escrever um command diferente)
+    — sem isso, todo atuador nascia em 0.0 incondicionalmente, mesmo quando `application.toml` já
+    tinha o valor certo em `[state.valves]`. Sem `config`, comportamento inalterado (nasce em 0.0):
+    nem todo atuador hipotético tem um "nominal" natural no Snapshot.
+    */
+    let initial_tokens = match &config {
+        Some(config_key) => quote! { config.get(#config_key).unwrap_or(0.0) },
+        None => quote! { 0.0 },
+    };
+
     /* O nome do campo vira também o nome do getter gerado — Rust permite campo e método com o
     mesmo nome na mesma struct (namespaces diferentes, desambiguados por `()`); é assim que
     `self.command()` (getter) convive com o campo interno `command` (agora um `Cell<f64>` real,
@@ -125,11 +136,16 @@ pub fn actuator(attr: TokenStream, item: TokenStream) -> TokenStream {
             /** `new()` já registra o atuador no catálogo do StateRegistry sob a própria chave —
             mesma invariante de `actuator::model::Actuator::new()`: "criado = já oferecido".
             */
-            pub fn new(registry: &mut ::monjolo::state_registry::StateRegistry) -> ::std::rc::Rc<Self> {
+            pub fn new(
+                registry: &mut ::monjolo::state_registry::StateRegistry,
+                config: &::monjolo::snapshot::Snapshot,
+            ) -> ::std::rc::Rc<Self> {
                 let __derivative_key = ::std::format!("{}.derivative", #key);
                 let (__offered, _) = registry.subscribe(&[#key, &__derivative_key], &[]);
+                let __initial: f64 = #initial_tokens;
+                __offered[0].set(__initial);
                 let __instance = ::std::rc::Rc::new(Self {
-                    #command_field: ::std::cell::Cell::new(0.0),
+                    #command_field: ::std::cell::Cell::new(__initial),
                     #state_field: __offered[0].clone(),
                     __derivative: __offered[1].clone(),
                 });
@@ -169,9 +185,9 @@ pub fn actuator(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: ::std::stringify!(#struct_name),
                 kind: ::monjolo::ComponentKind::Actuator,
                 after: &[],
-                construct: |registry: &mut ::monjolo::state_registry::StateRegistry, _config: &::monjolo::snapshot::Snapshot| {
+                construct: |registry: &mut ::monjolo::state_registry::StateRegistry, config: &::monjolo::snapshot::Snapshot| {
                     ::std::option::Option::Some(
-                        ::std::boxed::Box::new(#struct_name::new(registry))
+                        ::std::boxed::Box::new(#struct_name::new(registry, config))
                             as ::std::boxed::Box<dyn ::monjolo::dynamic_model::DynamicModel>,
                     )
                 },
@@ -180,6 +196,36 @@ pub fn actuator(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+struct ActuatorArgs {
+    key: String,
+    config: Option<String>,
+}
+
+impl syn::parse::Parse for ActuatorArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let pairs = syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated(input)?;
+
+        let mut key = None;
+        let mut config = None;
+
+        for pair in &pairs {
+            if pair.path.is_ident("key") {
+                key = Some(expect_str_lit(&pair.value)?);
+            } else if pair.path.is_ident("config") {
+                config = Some(expect_str_lit(&pair.value)?);
+            } else {
+                return Err(syn::Error::new_spanned(&pair.path, "esperado `key` ou `config`"));
+            }
+        }
+
+        let key = key.ok_or_else(|| {
+            syn::Error::new(proc_macro2::Span::call_site(), "falta `key = \"...\"`")
+        })?;
+
+        Ok(ActuatorArgs { key, config })
+    }
 }
 
 #[proc_macro_attribute]
