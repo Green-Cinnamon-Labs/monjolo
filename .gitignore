@@ -1,1 +1,6 @@
 /target
+**/target/
+
+# Certificado/chave gerados em runtime pelo servidor OPC-UA (async-opcua-server) na primeira
+# conexão — nunca versionar chave privada.
+/pki/

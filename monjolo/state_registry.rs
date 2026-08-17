@@ -379,11 +379,16 @@ impl StateRegistry {
     /** Registra um `Sensor` já construído sob um nome — imediato, mesmo papel de um `offers` de
     `subscribe()`: a posição no catálogo já é conhecida no momento em que é criada.
 
-    `pub(crate)`, não `pub`: quem monta a planta nunca chama isso diretamente — `Sensor::new()`
-    (`sensor/model.rs`) já chama, internamente, sob a própria `key`, e devolve o `Arc` resultante.
-    "Criado = já oferecido" é uma invariante do tipo, não uma etapa manual de quem constrói.
+    `pub`, não `pub(crate)`: era `pub(crate)` enquanto só `Sensor::new()` (`sensor/model.rs`), dentro
+    deste crate, chamava isso. Deixou de bastar quando `#[sensor(...)]` (`monjolo-macros`) passou a
+    gerar um `new()` equivalente — mesmo formato, mesma disciplina —, só que expandido dentro do
+    crate de quem usa a macro (ex.: `tep-plant`), fora da fronteira de `pub(crate)`. "Criado = já
+    oferecido" continua valendo, mas agora é uma convenção de quem escreve um construtor (chamar
+    `offer_*` como último passo de `new()`, sob a mesma `key` do `subscribe()`), não mais algo que o
+    compilador força sozinho — igual ao resto deste registry, que já confia em quem implementa
+    `Actuator`/`Sensor`/`Controller` pra não mentir sobre `Send`/`Sync`.
     */
-    pub(crate) fn offer_sensor(&mut self, name: &str, sensor: Arc<dyn Sensor>) {
+    pub fn offer_sensor(&mut self, name: &str, sensor: Arc<dyn Sensor>) {
         let idx = self.sensor_catalog.borrow().len();
         self.sensor_catalog.borrow_mut().push(sensor);
         self.sensor_index.insert(name.to_string(), idx);
@@ -413,10 +418,11 @@ impl StateRegistry {
     }
 
     /* Mesma ideia de offer_sensor()/need_sensor()/sensor_names()/sensor(), pro catálogo de
-    atuadores nomeados — `pub(crate)` pelo mesmo motivo: só `Actuator::new()`
-    (`actuator/model.rs`) chama isso, sob a própria `key`.
+    atuadores nomeados — `pub` pelo mesmo motivo agora: além de `Actuator::new()`
+    (`actuator/model.rs`), `#[actuator(...)]` (`monjolo-macros`) gera um `new()` que também chama
+    isso, expandido fora deste crate.
     */
-    pub(crate) fn offer_actuator(&mut self, name: &str, actuator: Rc<dyn Actuator>) {
+    pub fn offer_actuator(&mut self, name: &str, actuator: Rc<dyn Actuator>) {
         let idx = self.actuator_catalog.borrow().len();
         self.actuator_catalog.borrow_mut().push(actuator);
         self.actuator_index.insert(name.to_string(), idx);
@@ -441,11 +447,11 @@ impl StateRegistry {
     buscar um Controller pelo nome (`controller/mod.rs` ainda não tem design fechado pra isso),
     então não há `need_controller()`: um Controller concreto resolve as próprias dependências de
     `Sensor`/`Actuator` via `need_sensor()`/`need_actuator()` normalmente, na própria construção —
-    isso aqui é só o catálogo pra descoberta. `pub(crate)`, mesmo motivo de `offer_sensor`/
-    `offer_actuator`: só `Controller::new()` (`controller/model.rs`) chama isso, sob o `name` que
-    recebeu.
+    isso aqui é só o catálogo pra descoberta. `pub`, mesmo motivo de `offer_sensor`/`offer_actuator`:
+    além de `Controller::new()` (`controller/model.rs`), um futuro `#[controller(...)]`
+    (`monjolo-macros`) vai precisar chamar isso de fora deste crate também.
     */
-    pub(crate) fn offer_controller(&mut self, name: &str, controller: Rc<dyn Controller>) {
+    pub fn offer_controller(&mut self, name: &str, controller: Rc<dyn Controller>) {
         let idx = self.controller_catalog.borrow().len();
         self.controller_catalog.borrow_mut().push(controller);
         self.controller_index.insert(name.to_string(), idx);

@@ -25,8 +25,15 @@ forma da lei, só que ela existe.
 `command` é `Cell<f64>`, não campo simples: `write(&self, ...)` (contrato de `Actuator`) e
 `evaluate(&self)` (contrato de `DynamicModel`) não recebem `&mut self`, mas precisam mutar `command`
 — mutabilidade interior, mesmo raciocínio de `EvaluationState`/`Proxy`.
+
+`key` fica guardada (antes só vivia como parâmetro local de `new()`) porque `state_keys()` precisa
+devolvê-la — invariante do framework: todo `DynamicModel` que declara estado integrável precisa que
+o `Integrator` enxergue isso (`Composite::state_keys()` agrega os filhos; ver dynamic_model.rs). Sem
+isso, `state`/`derivative` (os `Proxy`) nunca eram avançados pelo RK4 — só `evaluate()` calculava a
+derivada, nada integrava `state` com ela.
 */
 pub struct Actuator {
+    key: String,
     command: Cell<f64>,
     state: Proxy,
     derivative: Proxy,
@@ -53,6 +60,7 @@ impl Actuator {
         let (offered, _) = registry.subscribe(&[key, &derivative_key], &[]);
 
         let actuator = Rc::new(Self {
+            key: key.to_string(),
             command: Cell::new(0.0),
             state: offered[0].clone(),
             derivative: offered[1].clone(),
@@ -74,6 +82,10 @@ impl DynamicModel for Actuator {
         let command = self.command.get();
         let state = self.state.get();
         self.derivative.set((self.dynamics)(command, state));
+    }
+
+    fn state_keys(&self) -> Vec<String> {
+        vec![self.key.clone()]
     }
 }
 
@@ -113,8 +125,9 @@ mod tests {
     }
 
     /** Prova a invariante nova: `Actuator::new()` já registra o atuador no catálogo de
-    `StateRegistry`, sob a própria `key` — ninguém precisa chamar `offer_actuator()` à parte, e nem
-    poderia (é `pub(crate)`).
+    `StateRegistry`, sob a própria `key` — ninguém precisa chamar `offer_actuator()` à parte
+    (continua a única chamada dentro deste `new()`, mesmo `offer_actuator` sendo `pub` hoje pra
+    caber o `new()` que `#[actuator(...)]` gera fora deste crate — ver state_registry.rs).
     */
     #[test]
     fn new_registers_itself_under_its_own_key() {
@@ -126,5 +139,17 @@ mod tests {
 
         let found = registry.borrow().actuator("purge").expect("deveria estar no catálogo");
         assert!(Rc::ptr_eq(&actuator, &found));
+    }
+
+    /** Prova o outro lado do mesmo invariante (ver dynamic_model.rs::tests): `state_keys()` não
+    pode ficar vazio pra um Actuator — sem isso, `state`/`derivative` nunca eram avançados pelo
+    Integrator de verdade, só o cálculo de `derivative` acontecia.
+    */
+    #[test]
+    fn state_keys_declares_its_own_key() {
+        let registry = StateRegistry::shared();
+        let actuator = Actuator::new(&mut registry.borrow_mut(), "valve.feed_d.position", |c, s| c - s);
+
+        assert_eq!(actuator.state_keys(), vec!["valve.feed_d.position".to_string()]);
     }
 }

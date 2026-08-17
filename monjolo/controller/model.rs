@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::actuator::Actuator;
+use crate::dynamic_model::DynamicModel;
 use crate::sensor::Sensor;
 use crate::state_registry::{ActuatorHandle, SensorHandle, StateRegistry};
 
@@ -29,7 +30,7 @@ impl Controller {
 
     `name` é o nome de catálogo do próprio controller — devolve `Rc<Self>`, não `Self`: mesma
     invariante de `Sensor`/`Actuator` (Art. 7.1 §1/12.1 §1), "criado = já oferecido". `new()` já
-    registra o controller sob `name` (`offer_controller()`, `pub(crate)`) antes de devolver.
+    registra o controller sob `name` (`offer_controller()`) antes de devolver.
     */
     pub fn new(
         registry: &mut StateRegistry,
@@ -62,6 +63,18 @@ impl Controller {
     pub fn actuator(&self, name: &str) -> Option<Rc<dyn Actuator>> {
         self.actuators.get(name).map(ActuatorHandle::actuator)
     }
+}
+
+/** Fase (C) da árvore de avaliação (dynamic_model.rs/component.rs) é definida como "Controllers :
+DynamicModel", mesmo sem lógica de controle nenhuma existir ainda — `evaluate()` vazio de propósito:
+ocupa a fase estruturalmente (sempre depois de todos os Actuators), pronto pra quando step()/PID/
+frequência de execução existirem, sem inventar essa semântica agora. Um único `impl` aqui cobre TODO
+Controller, escrito à mão ou via `#[controller(...)]` (`monjolo-macros`, que só embrulha
+`Controller::new()` — nunca poderia emitir este `impl` sozinho: trait E tipo são de `monjolo`, fora
+do crate de quem usa a macro, e um `impl` por invocação colidiria com os outros).
+*/
+impl DynamicModel for Controller {
+    fn evaluate(&self) {}
 }
 
 impl super::Controller for Controller {}
@@ -107,8 +120,7 @@ mod tests {
     }
 
     /** Prova a invariante nova: `Controller::new()` já registra o controller no catálogo de
-    `StateRegistry`, sob `name` — ninguém precisa chamar `offer_controller()` à parte, e nem
-    poderia (é `pub(crate)`).
+    `StateRegistry`, sob `name` — ninguém precisa chamar `offer_controller()` à parte.
     */
     #[test]
     fn new_registers_itself_under_name() {

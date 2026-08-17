@@ -1,0 +1,20 @@
+# Crate separado de propósito: `proc-macro = true` não pode dividir crate com código normal em
+# Rust estável — não tem como `monjolo` exportar as macros e os tipos de runtime do mesmo Cargo.toml.
+# `monjolo` depende deste crate por caminho e reexporta as macros através de si mesmo; quem usa
+# `monjolo` nunca precisa saber que este crate existe (ver CONTRIBUTING.md quando isso for
+# formalizado).
+
+[package]
+name = "monjolo-macros"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+path = "macros/lib.rs"
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

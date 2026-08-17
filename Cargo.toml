@@ -11,17 +11,32 @@ license = "Apache-2.0"
 
 [lib]
 name = "monjolo"
-path = "src/lib.rs"
+path = "monjolo/lib.rs"
 
 [dependencies]
 rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
 toml = "0.8"
-opcua = { package = "async-opcua", version = "0.18", features = ["server"], optional = true }
+opcua = { package = "async-opcua", version = "0.18", features = ["server", "client"], optional = true }
 tokio = { version = "1", features = ["rt", "time"], optional = true }
+# proc-macro = true não pode dividir crate com código normal — monjolo-macros mora ao lado, monjolo
+# reexporta as macros através de si mesmo (ver monjolo-macros/Cargo.toml).
+monjolo-macros = { path = "monjolo-macros" }
+# Auto-registro de componentes declarados via macro (#[actuator(...)] etc.) — cada um se "anuncia"
+# num inventory::submit! escondido, gerado pela macro; Simulation varre inventory::iter na hora do
+# bootstrap. Reexportado (ver lib.rs) pra quem usa a macro em outro crate não precisar depender de
+# `inventory` diretamente.
+inventory = "0.3"
 
 [features]
 # Adaptador OPC-UA (opcua_adapter) — puxa async-opcua + tokio, pesados
 # demais pra serem dependência default de um framework de simulação
 # genérico. O resto do crate não sabe nada disso.
 opcua = ["dep:opcua", "dep:tokio"]
+
+# required-features: sem isso, `cargo build`/`cargo test` sem --features opcua tentam compilar o
+# exemplo mesmo assim (target de exemplo é compilado por padrão) e falham — opcua_browse.rs usa
+# opcua::client/tokio::main, só existem com a feature ligada.
+[[example]]
+name = "opcua_browse"
+required-features = ["opcua"]

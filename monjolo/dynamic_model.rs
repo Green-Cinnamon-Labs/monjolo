@@ -114,6 +114,18 @@ impl DynamicModel for Composite {
     fn evaluate(&self) {
         self.evaluate_children();
     }
+
+    /** Invariante do framework: todo `DynamicModel` participa da integração — se algo declara
+    estado integrável em `state_keys()`, o `Integrator` precisa enxergar isso, não importa quantos
+    níveis de `Composite` existam entre ele e `Simulation::set_model()`. Um `Composite` não tem
+    estado próprio (default do trait seria certo pra ele *sozinho*), mas teria estado dos FILHOS
+    escondido dele se não agregasse — por isso soma recursivamente `state_keys()` de cada um
+    (`Box<dyn DynamicModel>` despacha pro tipo concreto; se um filho for outro `Composite`, a mesma
+    agregação se aplica de novo, sem precisar de nada especial aqui).
+    */
+    fn state_keys(&self) -> Vec<String> {
+        self.models.iter().flat_map(|model| model.state_keys()).collect()
+    }
 }
 
 impl CompositeDynamicModel for Composite {
@@ -145,5 +157,56 @@ impl<T: DynamicModel + ?Sized> DynamicModel for Rc<T> {
 
     fn state_keys(&self) -> Vec<String> {
         (**self).state_keys()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StatefulLeaf(&'static str);
+
+    impl DynamicModel for StatefulLeaf {
+        fn evaluate(&self) {}
+
+        fn state_keys(&self) -> Vec<String> {
+            vec![self.0.to_string()]
+        }
+    }
+
+    struct StatelessLeaf;
+
+    impl DynamicModel for StatelessLeaf {
+        fn evaluate(&self) {}
+    }
+
+    /* Prova a correção do invariante: um Composite não tem estado próprio, mas não pode esconder
+    o estado dos filhos — antes desta correção, Composite::state_keys() usava o default (vazio) do
+    trait, então nenhum Actuator (ou qualquer DynamicModel-folha) jamais tinha seu estado integrado
+    pelo RK4, não importa quantos fossem add_dynamic'd.
+    */
+    #[test]
+    fn aggregates_state_keys_from_every_child() {
+        let mut composite = Composite::new();
+        composite.add_dynamic(Box::new(StatefulLeaf("a.position")));
+        composite.add_dynamic(Box::new(StatelessLeaf));
+        composite.add_dynamic(Box::new(StatefulLeaf("b.position")));
+
+        assert_eq!(composite.state_keys(), vec!["a.position", "b.position"]);
+    }
+
+    /* Um Composite dentro de outro Composite não pode virar um buraco negro pro estado dos netos —
+    a agregação precisa ser recursiva, não só um nível.
+    */
+    #[test]
+    fn aggregates_recursively_through_nested_composites() {
+        let mut inner = Composite::new();
+        inner.add_dynamic(Box::new(StatefulLeaf("inner.state")));
+
+        let mut outer = Composite::new();
+        outer.add_dynamic(Box::new(inner));
+        outer.add_dynamic(Box::new(StatefulLeaf("outer.state")));
+
+        assert_eq!(outer.state_keys(), vec!["inner.state", "outer.state"]);
     }
 }
