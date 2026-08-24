@@ -15,13 +15,17 @@ compartilhado (não copiado). `Sensor` é `Send + Sync` de verdade (`ReadProxy` 
 então atravessa pra esta thread sem bridge nenhuma: `Sensor::read()` já garante, sozinho, que duas
 leituras dentro da mesma `generation` de `CurrentState` devolvem o mesmo valor.
 
-Atuadores NÃO atravessam — `Actuator` guarda `Proxy` (`Rc`-based), `!Send`/`!Sync` por construção, e
-isso não muda aqui (mudar seria tocar o caminho mais quente do framework, lido/escrito em todo
-sub-passo do RK4). Em vez disso, cada node writable manda `(nome, valor)` por `commands` — um
-`std::sync::mpsc::Sender` clonado por node — pra Thread da planta, que drena e chama
-`actuator.write()` localmente, sem que nenhum `Rc` cruze a fronteira. `add_write_callback` exige
-`Fn(...) + Send + Sync + 'static`; `Sender<(String, f64)>` é `Send + Sync` (mpsc reescrito desde Rust
-1.72) — a closure só clona o `Sender` e o nome, nunca o `Actuator`.
+Atuadores viram um único node por nome, writable E atualizado por push — as duas coisas. `Actuator`
+em si NÃO atravessa — guarda `Proxy` (`Rc`-based), `!Send`/`!Sync` por construção, e isso não muda
+aqui (mudar seria tocar o caminho mais quente do framework, lido/escrito em todo sub-passo do RK4).
+A ESCRITA (comando entrando) continua pelo canal: cada node manda `(nome, valor)` por `commands` —
+um `std::sync::mpsc::Sender` clonado por node — pra Thread da planta, que drena e chama
+`actuator.write()` localmente, sem que nenhum `Rc` cruze a fronteira. A LEITURA (posição saindo) usa
+o mesmo truque de sempre: quem chama `serve()` (`Simulation::spawn_adapter_thread`) constrói um
+`Sensor` "espelho" na MESMA chave pra cada atuador — `Sensor` só lê de volta um valor que já existe
+no `StateRegistry` (aqui, o próprio `#[state]` do atuador), então herda de graça o mesmo caminho
+`Send + Sync` que os sensores de verdade já usam. Sem isso, o node ficava travado no valor inicial
+pra sempre: só o write callback existia, nada nunca publicava a posição de volta.
 */
 
 use std::collections::HashMap;
@@ -52,9 +56,9 @@ node, por isso "funciona" enquanto Read/Write silenciosamente não.
 const APPLICATION_URI: &str = "urn:monjolo:opcua-adapter:app";
 
 /** Sobe um servidor OPC-UA: um node read-only por sensor em `sensors` (lido via `sensor.read()` a
-cada tick — já passa pelo `SensorBehavior` do próprio sensor), um node writable por nome em
-`actuator_names` (escrita não aplica nada aqui — só manda `(nome, valor)` por `commands` pra quem
-tem acesso de verdade ao `Actuator`, a Thread da planta).
+cada tick — já passa pelo `SensorBehavior` do próprio sensor), um node read-write por nome em
+`actuators` (lido via o `Sensor` espelho associado, escrito via `commands` — quem tem acesso de
+verdade ao `Actuator` é a Thread da planta, nunca esta).
 
 `endpoint` no formato `opc.tcp://<host>:<porta><path>`, ex.: `"opc.tcp://0.0.0.0:4840/tep/server/"`.
 
@@ -62,7 +66,7 @@ Bloqueia até o servidor encerrar (erro fatal — não há shutdown gracioso ain
 */
 pub async fn serve(
     sensors: HashMap<String, Arc<dyn Sensor>>,
-    actuator_names: Vec<String>,
+    actuators: HashMap<String, Arc<dyn Sensor>>,
     commands: Sender<(String, f64)>,
     endpoint: &str,
 ) -> Result<(), String> {
@@ -108,7 +112,7 @@ pub async fn serve(
         .get_namespace_index(NAMESPACE_URI)
         .ok_or_else(|| "namespace não registrado".to_string())?;
 
-    let sensor_nodes: Vec<(NodeId, Arc<dyn Sensor>)> = {
+    let push_nodes: Vec<(NodeId, Arc<dyn Sensor>)> = {
         let address_space = node_manager.address_space();
         let mut address_space = address_space.write();
 
@@ -120,19 +124,23 @@ pub async fn serve(
             &NodeId::objects_folder_id(),
         );
 
-        let sensor_nodes: Vec<(NodeId, Arc<dyn Sensor>)> = sensors
-            .into_iter()
-            .map(|(name, sensor)| {
-                let node_id = NodeId::new(ns, name.clone());
-                let _ = address_space.add_variables(
-                    vec![Variable::new(&node_id, name.as_str(), name.as_str(), 0f64)],
-                    &folder_id,
-                );
-                (node_id, sensor)
-            })
-            .collect();
+        let mut push_nodes: Vec<(NodeId, Arc<dyn Sensor>)> = Vec::new();
 
-        for name in actuator_names {
+        for (name, sensor) in sensors {
+            let node_id = NodeId::new(ns, name.clone());
+            let _ = address_space.add_variables(
+                vec![Variable::new(&node_id, name.as_str(), name.as_str(), 0f64)],
+                &folder_id,
+            );
+            push_nodes.push((node_id, sensor));
+        }
+
+        /* Um único node por atuador, read-write — a mesma NodeId entra na lista de push (lida via
+        o Sensor espelho) E ganha o write callback (comando entrando). Não são dois nodes: seria
+        ambíguo pro cliente OPC-UA (qual dos dois é "a válvula X"?) e a UI nem deixaria escrever
+        no que parece ser um node read-only.
+        */
+        for (name, shadow_sensor) in actuators {
             let node_id = NodeId::new(ns, name.clone());
             let mut var = Variable::new(&node_id, name.as_str(), name.as_str(), 0f64);
             /* `set_writable()` só mexe em `access_level` (capacidade do SERVIDOR) — o serviço de
@@ -146,7 +154,7 @@ pub async fn serve(
 
             let commands = commands.clone();
             node_manager.inner().add_write_callback(
-                node_id,
+                node_id.clone(),
                 move |data_value: DataValue, _range: &NumericRange| match data_value
                     .value
                     .as_ref()
@@ -159,9 +167,11 @@ pub async fn serve(
                     None => StatusCode::BadTypeMismatch,
                 },
             );
+
+            push_nodes.push((node_id, shadow_sensor));
         }
 
-        sensor_nodes
+        push_nodes
     };
 
     let subscriptions = handle.subscriptions().clone();
@@ -171,7 +181,7 @@ pub async fn serve(
         loop {
             interval.tick().await;
 
-            let updates: Vec<_> = sensor_nodes
+            let updates: Vec<_> = push_nodes
                 .iter()
                 .map(|(node_id, sensor)| (node_id, None, DataValue::new_now(sensor.read())))
                 .collect();

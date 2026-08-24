@@ -414,10 +414,19 @@ impl Simulation {
     `AdapterConfig::OpcUa`. Roda num runtime tokio `current_thread` próprio (sem pool de worker
     threads — não há trabalho paralelo real a justificar um, ver `adapter/opcua.rs`).
 
-    Só `Arc<dyn Sensor>` (catalogado, já Send+Sync de verdade) e os NOMES dos atuadores atravessam
-    pra essa thread — nenhum `Rc`/`Proxy`/`StateRegistry` sai daqui. Devolve o lado de leitura de um
-    canal `(nome, valor)`: escrita de atuador nunca acontece nesta thread, só é anunciada por ela —
-    quem aplica de verdade é `spawn_plant_thread`, drenando esse canal a cada tick.
+    Só `Arc<dyn Sensor>` (catalogado, já Send+Sync de verdade) atravessa pra essa thread — nenhum
+    `Rc`/`Proxy`/`StateRegistry` sai daqui. Devolve o lado de leitura de um canal `(nome, valor)`:
+    escrita de atuador nunca acontece nesta thread, só é anunciada por ela — quem aplica de
+    verdade é `spawn_plant_thread`, drenando esse canal a cada tick.
+
+    `actuators`: cada atuador ganha um `Sensor` "espelho" só-leitura na MESMA chave (`Sensor` nunca
+    inventa valor próprio, só lê de volta um `#[state]`/`#[offer]` que já existe — a própria posição
+    do atuador, exatamente como `ReactorPressure` lê `reactor.temperature`) — sem isso, `serve()`
+    não tinha como publicar a posição de volta pro cliente OPC-UA: só existia o write callback
+    (comando entrando), o node ficava travado no `0.0` inicial pra sempre, nunca refletindo o
+    estado de verdade. Construído (e resolvido de novo) AQUI, depois do resolve() geral em
+    `spawn_plant_thread` — sensores novos precisam de outro `resolve()` antes de `read()` ser
+    seguro (mesmo ciclo declare → resolve de qualquer `Sensor`).
 
     Erro do servidor OPC-UA (`serve()` retornando `Err`, ex.: porta ocupada) só é logado — não
     propaga pro `ServiceEvent` do supervisor nesta primeira versão; simplificação deliberada, não um
@@ -442,8 +451,25 @@ impl Simulation {
                     (name.to_string(), sensor)
                 })
                 .collect();
+
         let actuator_names: Vec<String> =
             registry.borrow().actuator_names().map(String::from).collect();
+        let actuators: std::collections::HashMap<String, std::sync::Arc<dyn crate::sensor::Sensor>> =
+            actuator_names
+                .iter()
+                .map(|name| {
+                    let shadow = crate::sensor::model::Sensor::new(
+                        &mut registry.borrow_mut(),
+                        name,
+                        Box::new(crate::sensor::model::Ideal),
+                    );
+                    (name.clone(), shadow as std::sync::Arc<dyn crate::sensor::Sensor>)
+                })
+                .collect();
+        registry
+            .borrow_mut()
+            .resolve()
+            .expect("adapter thread: falha ao resolver os sensores-espelho dos atuadores");
 
         let (command_tx, command_rx) = std::sync::mpsc::channel::<(String, f64)>();
 
@@ -457,7 +483,7 @@ impl Simulation {
 
                 let outcome = runtime.block_on(crate::adapter::opcua::serve(
                     sensors,
-                    actuator_names,
+                    actuators,
                     command_tx,
                     &endpoint,
                 ));
