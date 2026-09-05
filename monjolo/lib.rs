@@ -10,6 +10,8 @@ extern crate self as monjolo;
 
 pub mod actuator;
 pub mod adapter;
+#[cfg(feature = "chemistry")]
+pub mod chemistry;
 pub mod component;
 pub mod controller;
 pub mod disturbance;
