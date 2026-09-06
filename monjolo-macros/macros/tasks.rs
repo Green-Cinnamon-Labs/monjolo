@@ -127,16 +127,15 @@ fn build_task(
 
     let mut need_specs: Vec<FieldKeySpec> = Vec::new();
     let mut offer_specs: Vec<FieldKeySpec> = Vec::new();
+    /* Atributos que não são `#[need]`/`#[offer]` (doc comments, `#[allow(...)]`, etc.) não são
+    erro — `impl_method.attrs.retain(...)` abaixo já os preserva no método renomeado, intocados.
+    Só `need`/`offer` são consumidos aqui.
+    */
     for attr in &method.attrs {
         if attr.path().is_ident("need") {
             need_specs.push(parse_key_spec(attr)?);
         } else if attr.path().is_ident("offer") {
             offer_specs.push(parse_key_spec(attr)?);
-        } else {
-            return Err(syn::Error::new_spanned(
-                attr,
-                "#[monjolo::tasks] só reconhece #[need(...)]/#[offer(...)] em métodos marcados",
-            ));
         }
     }
 
