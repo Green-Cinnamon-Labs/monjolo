@@ -27,6 +27,7 @@ a `add_dynamic`/`offer_*` em lugar nenhum.
 */
 
 mod dynamic_model;
+mod tasks;
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -35,6 +36,16 @@ use syn::{parse_macro_input, Fields, ItemStruct};
 #[proc_macro_attribute]
 pub fn dynamic_model(attr: TokenStream, item: TokenStream) -> TokenStream {
     dynamic_model::expand(attr, item)
+}
+
+/** `#[monjolo::tasks]` — ver `tasks.rs`. Aplicado ao `impl X { ... }` inteiro de uma unidade
+`#[dynamic_model(tasks)]`; a implementação mora em arquivo próprio pelo mesmo motivo de
+`dynamic_model.rs` (grande o bastante pra merecer, e `#[proc_macro_attribute]` precisa ficar na
+raiz do crate por exigência do rustc — esta função aqui só delega).
+*/
+#[proc_macro_attribute]
+pub fn tasks(attr: TokenStream, item: TokenStream) -> TokenStream {
+    tasks::expand(attr, item)
 }
 
 #[proc_macro_attribute]
@@ -185,6 +196,8 @@ pub fn actuator(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: ::std::stringify!(#struct_name),
                 kind: ::monjolo::ComponentKind::Actuator,
                 after: &[],
+                needs: &[],
+                offers: &[],
                 construct: |registry: &mut ::monjolo::state_registry::StateRegistry, config: &::monjolo::snapshot::Snapshot| {
                     ::std::option::Option::Some(
                         ::std::boxed::Box::new(#struct_name::new(registry, config))
@@ -276,6 +289,8 @@ pub fn sensor(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: ::std::stringify!(#struct_name),
                 kind: ::monjolo::ComponentKind::Sensor,
                 after: &[],
+                needs: &[],
+                offers: &[],
                 construct: |registry: &mut ::monjolo::state_registry::StateRegistry, _config: &::monjolo::snapshot::Snapshot| {
                     #struct_name::new(registry);
                     ::std::option::Option::None
@@ -426,6 +441,8 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: ::std::stringify!(#struct_name),
                 kind: ::monjolo::ComponentKind::Controller,
                 after: &[],
+                needs: &[],
+                offers: &[],
                 construct: |registry: &mut ::monjolo::state_registry::StateRegistry, _config: &::monjolo::snapshot::Snapshot| {
                     ::std::option::Option::Some(
                         ::std::boxed::Box::new(#struct_name::new(registry))

@@ -283,6 +283,21 @@ pub struct StateRegistry {
     */
     controller_catalog: Rc<RefCell<Vec<Rc<dyn Controller>>>>,
     controller_index: HashMap<String, usize>,
+
+    /** Catálogo de instâncias de `#[dynamic_model]` nomeadas — mesma forma dos catálogos acima, só
+    que pra `Rc<dyn Any>` em vez de um trait de domínio (`Sensor`/`Actuator`/`Controller`): uma
+    unidade (`Reactor`, `Separator`, ...) não compartilha nenhum trait comum além de `DynamicModel`,
+    que não expõe os métodos inerentes que uma tarefa (`#[monjolo::tasks]`) precisa chamar de volta
+    (`__outlet_flow_impl` etc.) — por isso o catálogo guarda o tipo concreto, via downcast
+    (`Rc<dyn Any>::downcast::<T>()`), nunca um trait object de domínio. Só lado "offer" + leitura
+    imediata (`instance`), sem `pending`/`Handle`: ao contrário de sensor/actuator/controller, a
+    ordem de construção aqui é garantida estruturalmente (`#[monjolo::tasks]` injeta `after =
+    [nome_da_struct]` em toda tarefa que gera — a própria unidade sempre constrói, e portanto
+    oferece, antes de qualquer tarefa dela rodar `construct()`), então não precisa do dance de
+    duas fases que `need_sensor()`/`need_actuator()` fazem pra tolerar ordem de descoberta arbitrária.
+    */
+    instance_catalog: Rc<RefCell<Vec<Rc<dyn std::any::Any>>>>,
+    instance_index: HashMap<String, usize>,
 }
 
 impl StateRegistry {
@@ -304,6 +319,8 @@ impl StateRegistry {
             pending_actuator_requests: Vec::new(),
             controller_catalog: Rc::new(RefCell::new(Vec::new())),
             controller_index: HashMap::new(),
+            instance_catalog: Rc::new(RefCell::new(Vec::new())),
+            instance_index: HashMap::new(),
         }
     }
 
@@ -464,6 +481,32 @@ impl StateRegistry {
     pub fn controller(&self, name: &str) -> Option<Rc<dyn Controller>> {
         let idx = *self.controller_index.get(name)?;
         self.controller_catalog.borrow().get(idx).cloned()
+    }
+
+    /** Registra a instância de uma unidade `#[dynamic_model]` sob seu próprio nome (tipicamente
+    `stringify!(Struct)`, gerado pela própria macro) — mesma invariante "criado = já oferecido" de
+    `offer_actuator`/`offer_sensor`. Chamado como último passo do `new()` gerado por
+    `#[dynamic_model]`, incondicionalmente (mesmo pra unidades sem nenhuma `#[monjolo::tasks]` —
+    custo desprezível, e evita a struct precisar saber se tem tarefa alguma).
+    */
+    pub fn offer_instance<T: 'static>(&mut self, name: &str, instance: Rc<T>) {
+        let idx = self.instance_catalog.borrow().len();
+        self.instance_catalog.borrow_mut().push(instance as Rc<dyn std::any::Any>);
+        self.instance_index.insert(name.to_string(), idx);
+    }
+
+    /** Busca a instância de uma unidade pelo nome, já resolvida com o tipo concreto certo — usado
+    pelo `construct` de uma tarefa (`#[monjolo::tasks]`) pra obter o `Rc<Reactor>` sobre o qual vai
+    chamar o método `__impl`. Leitura IMEDIATA (não duas fases como `need_sensor`/`need_actuator`):
+    a ordem de construção (unidade antes de suas tarefas) é garantida por fora, via `after`
+    auto-injetado na fase (A) — ver `component.rs` — não por um `resolve()` posterior. `None` se o
+    nome não existe OU se existe mas sob outro tipo (downcast falho — nunca deveria acontecer com
+    código gerado pela macro, que sempre usa o mesmo `T` em `offer_instance`/`instance`).
+    */
+    pub fn instance<T: 'static>(&self, name: &str) -> Option<Rc<T>> {
+        let idx = *self.instance_index.get(name)?;
+        let any = self.instance_catalog.borrow().get(idx)?.clone();
+        any.downcast::<T>().ok()
     }
 
     /** Roda uma única vez, depois que tudo já se registrou — slots, sensores e atuadores. Resolve
@@ -656,5 +699,41 @@ mod tests {
             registry.controller_names().collect::<Vec<_>>(),
             vec!["reactor_pressure_control"]
         );
+    }
+
+    struct DummyUnit {
+        label: &'static str,
+    }
+
+    /* Prova o caminho de ida e volta do catálogo de instâncias: `offer_instance` guarda o tipo
+    concreto, `instance::<T>()` devolve exatamente a mesma alocação (não uma cópia) já com o tipo
+    certo — sem passar por `dyn Any` na API pública.
+    */
+    #[test]
+    fn offer_instance_then_instance_roundtrips_the_same_allocation() {
+        let mut registry = StateRegistry::new();
+        let unit = Rc::new(DummyUnit { label: "Reactor" });
+        registry.offer_instance("Reactor", unit.clone());
+
+        let found = registry.instance::<DummyUnit>("Reactor").expect("deveria estar catalogado");
+        assert!(Rc::ptr_eq(&unit, &found));
+        assert_eq!(found.label, "Reactor");
+    }
+
+    #[test]
+    fn instance_is_none_when_name_was_never_offered() {
+        let registry = StateRegistry::new();
+        assert!(registry.instance::<DummyUnit>("missing").is_none());
+    }
+
+    /* Downcast pro tipo ERRADO devolve None, não panic — nunca deveria acontecer com código gerado
+    pela macro (que sempre usa o mesmo `T` nos dois lados), mas a API não deve entrar em pânico se
+    isso um dia divergir.
+    */
+    #[test]
+    fn instance_is_none_when_downcast_type_does_not_match() {
+        let mut registry = StateRegistry::new();
+        registry.offer_instance("Reactor", Rc::new(DummyUnit { label: "Reactor" }));
+        assert!(registry.instance::<DummyActuator>("Reactor").is_none());
     }
 }

@@ -25,6 +25,8 @@ referência pra todo `construct()`; `#[dynamic_model]` usa isso pra semear campo
 (ver monjolo-macros/dynamic_model.rs). `#[actuator]`/`#[sensor]`/`#[controller]` recebem o parâmetro
 mas ainda não o usam — nenhum dos três tem campo `#[config(...)]` hoje.
 */
+use std::collections::HashMap;
+
 use crate::dynamic_model::{Composite, CompositeDynamicModel, DynamicModel};
 use crate::snapshot::Snapshot;
 use crate::state_registry::StateRegistry;
@@ -81,16 +83,28 @@ pub struct ComponentDescriptor {
     pub name: &'static str,
     pub kind: ComponentKind,
     /** Nomes (`ComponentDescriptor::name`, não chave de StateRegistry) de outros componentes da
-    MESMA fase que precisam ser construídos/anexados antes deste — único jeito de dar ordem
-    determinística dentro de uma fase sem tornar `inventory::iter` ordenado (não dá: é uma
-    propriedade do crate `inventory`, não algo que dá pra mudar aqui). Só faz sentido pra
-    `ComponentKind::Dynamic` hoje (`#[dynamic_model(after = [...])]`) — subsistemas físicos com
-    dependência real entre si na mesma rodada (Separator precisa de `reactor.temperature` do MESMO
-    tick, não do tick anterior). Vazio (`&[]`) pros outros três kinds: `Actuator`/`Controller` não
-    dependem de ordem entre si dentro da própria fase (ver comentário de `ComponentKind`), `Sensor`
-    nem entra em fase nenhuma.
+    MESMA fase que precisam ser construídos/anexados antes deste. Hoje é usado de duas formas: (1)
+    desempate entre candidatos igualmente prontos no sort por `needs`/`offers` (ver
+    `sort_phase_a` abaixo) — o caso comum antes de `needs`/`offers` existirem, ainda válido pra
+    quem não os declara; (2) ordem estrutural sem chave de dado nenhuma por trás — é assim que
+    `#[monjolo::tasks]` garante que a unidade dona já foi construída (e portanto já chamou
+    `offer_instance`) antes de qualquer tarefa dela rodar `construct()`, injetando `after =
+    [nome_da_struct]` automaticamente. Vazio (`&[]`) pros kinds `Actuator`/`Controller`/`Sensor`.
     */
     pub after: &'static [&'static str],
+    /** Chaves de `StateRegistry` que este componente PRECISA que já estejam publicadas por outro
+    componente da MESMA fase antes de rodar — junto com `offers`, é o que permite `sort_phase_a`
+    montar a ordem automaticamente a partir do GRAFO real de dependência (needs↔offers casando por
+    chave), em vez de exigir uma cadeia `after` hand-escrita cobrindo cada vizinho. Vazio (`&[]`)
+    por padrão — `#[actuator]`/`#[sensor]`/`#[controller]` não populam isso hoje.
+    */
+    pub needs: &'static [&'static str],
+    /** Chaves que este componente PUBLICA nesta fase — o lado "oferece" do mesmo grafo. Duas
+    chaves iguais ofertadas por dois componentes DIFERENTES da fase (A) é erro de programação
+    (`StateRegistry::subscribe` sobrescreveria silenciosamente o índice de uma delas) — `sort_phase_a`
+    detecta isso e entra em pânico no bootstrap, antes do primeiro `evaluate()`.
+    */
+    pub offers: &'static [&'static str],
     pub construct: fn(&mut StateRegistry, &Snapshot) -> Option<Box<dyn DynamicModel>>,
 }
 
@@ -131,40 +145,76 @@ pub fn attach_discovered_components(root: &mut Composite, registry: &mut StateRe
         debug_assert!(instance.is_none(), "descritor de Sensor ({}) devolveu Some — Sensor não é DynamicModel", descriptor.name);
     }
 
-    for descriptor in sort_by_dependency(phase_a)
-        .into_iter()
-        .chain(phase_b)
-        .chain(phase_c)
-    {
+    for descriptor in sort_phase_a(phase_a).into_iter().chain(phase_b).chain(phase_c) {
         if let Some(instance) = (descriptor.construct)(registry, config) {
             root.add_dynamic(instance);
         }
     }
 }
 
-/** Sort topológico simples (Kahn, O(n²) — a fase (A) tem poucos componentes na prática, não
-precisa de nada mais esperto) sobre `after` (nomes de OUTROS descritores da mesma fase que
-precisam vir antes). Um nome em `after` que não corresponde a nenhum descritor DESTA fase não
-bloqueia nada (não é erro aqui — se for uma chave de StateRegistry ausente de verdade, `resolve()`
-já pega isso; `after` só ordena entre quem foi descoberto). Um ciclo (ou dependência nunca
-satisfeita) não trava em loop infinito: o que sobrar sem conseguir progresso é despejado na ordem
-em que apareceu, mesma garantia fraca de antes de `after` existir.
+/** Sort topológico (Kahn, O(n²) — a fase (A) tem poucas dezenas de componentes na prática, não
+precisa de nada mais esperto) sobre o GRAFO REAL de dependência: um candidato está pronto quando
+(a) todo nome em `after` já foi ordenado ou não corresponde a nenhum descritor desta fase (ordem
+estrutural, sem chave de dado — ver comentário de `ComponentDescriptor::after`), E (b) toda chave em
+`needs` ou não é ofertada por ninguém nesta fase (satisfeita de fora — um valor de Actuator/Sensor,
+ou um campo ainda não migrado pra `#[monjolo::tasks]`) ou já foi ordenado quem a oferece. Isso
+substitui a cadeia `after` manual cobrindo cada vizinho por um grafo inferido automaticamente de
+`needs`/`offers` — necessário a partir do momento em que unidades passam a ter várias tarefas
+próprias com dependência cruzada real entre si (ex.: `Reactor::outlet_flow` precisa de
+`separator.pressure`, `Separator::pressure` precisa de `reactor.temperature` — dois NÓS diferentes,
+sem ciclo, impossível de expressar com `after` no grão de struct inteira).
+
+Ao contrário do sort anterior (que nunca falhava — o que sobrasse sem progresso era despejado na
+ordem em que apareceu), este ENTRA EM PÂNICO se: (1) duas chaves iguais são ofertadas por
+descritores diferentes desta fase (bug de programação — `StateRegistry::subscribe` sobrescreveria
+um índice silenciosamente); (2) sobra algum descritor sem conseguir progresso — um ciclo real, que
+`StateRegistry::resolve()` jamais detectaria sozinho (ele só checa "existe ALGUM ofertante", nunca
+"a ordem é executável"). As duas condições só podem acontecer por erro de quem declara
+`needs`/`offers`/`after` a mão ou por um bug na geração da macro — nunca por dado de usuário em
+runtime —, por isso pânico no bootstrap (antes do primeiro `evaluate()`) é apropriado, não um
+`Result` que a chamada precisaria propagar.
 */
-fn sort_by_dependency(mut remaining: Vec<&'static ComponentDescriptor>) -> Vec<&'static ComponentDescriptor> {
+fn sort_phase_a(mut remaining: Vec<&'static ComponentDescriptor>) -> Vec<&'static ComponentDescriptor> {
+    let mut offered_by: HashMap<&'static str, &'static ComponentDescriptor> = HashMap::new();
+    for candidate in &remaining {
+        for &key in candidate.offers {
+            if let Some(previous) = offered_by.insert(key, candidate) {
+                panic!(
+                    "chave '{key}' ofertada por dois componentes da fase (A): '{}' e '{}' — \
+                    StateRegistry::subscribe() sobrescreveria o índice de um dos dois silenciosamente",
+                    previous.name, candidate.name,
+                );
+            }
+        }
+    }
+
+    let is_settled = |name: &str, sorted: &[&'static ComponentDescriptor], remaining: &[&'static ComponentDescriptor]| {
+        sorted.iter().any(|s| s.name == name) || !remaining.iter().any(|r| r.name == name)
+    };
+
     let mut sorted: Vec<&'static ComponentDescriptor> = Vec::with_capacity(remaining.len());
 
     while !remaining.is_empty() {
         let ready_idx = remaining.iter().position(|candidate| {
-            candidate.after.iter().all(|dep_name| {
-                sorted.iter().any(|s| s.name == *dep_name)
-                    || !remaining.iter().any(|r| r.name == *dep_name)
-            })
+            let after_ok = candidate
+                .after
+                .iter()
+                .all(|dep_name| is_settled(dep_name, &sorted, &remaining));
+            let needs_ok = candidate.needs.iter().all(|key| match offered_by.get(key) {
+                Some(offerer) => is_settled(offerer.name, &sorted, &remaining),
+                None => true,
+            });
+            after_ok && needs_ok
         });
 
         match ready_idx {
             Some(idx) => sorted.push(remaining.remove(idx)),
             None => {
-                sorted.extend(remaining.drain(..));
+                let stuck: Vec<&str> = remaining.iter().map(|d| d.name).collect();
+                panic!(
+                    "ciclo real de dependência na fase (A) — nenhum destes componentes consegue \
+                    progresso: {stuck:?}. Verifique `needs`/`offers`/`after` de cada um."
+                );
             }
         }
     }
@@ -492,6 +542,77 @@ mod tests {
         );
     }
 
+    /* Prova a máquina inteira de `#[monjolo::tasks]` de ponta a ponta: `TaskDrivenUnit` só existe
+    via `#[dynamic_model(tasks)]` (sem `compute()`, sem `after` nenhum declarado) — sua única
+    física mora no método `doubled`, marcado `#[monjolo::tasks]`, que lê o PRÓPRIO campo ofertado
+    (`level`, semeado por `#[config]`) e publica "test.task_unit.doubled". `DownstreamTaskUnit`,
+    uma unidade DIFERENTE, tem uma tarefa (`tripled`) que PRECISA dessa mesma chave — nenhuma
+    delas declara `after` uma da outra; a ordem inteira (unidade→sua própria tarefa→tarefa de
+    outra unidade) sai só de casar `needs`/`offers`, mais o `after` auto-injetado que garante
+    "unidade antes de suas próprias tarefas" (sem ele, `registry.instance::<TaskDrivenUnit>(...)`
+    dentro do `construct` de `doubled` poderia rodar antes de `TaskDrivenUnit::new()` chamar
+    `offer_instance`). SEM `#[state]` de propósito: `#[dynamic_model]`/`inventory` são globais ao
+    binário de teste inteiro — um `#[state]` aqui exigiria uma `".derivative"` ofertada por
+    alguém, e vazaria pra QUALQUER outro teste que rode `Simulation::run()`/`attach_discovered_
+    components()` no mesmo processo (`#[state]` já tem cobertura própria em outro teste).
+    */
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct TaskDrivenUnit {
+        #[config(key = "test.task_unit.state.level")]
+        #[offer(key = "test.task_unit.level")]
+        level: f64,
+    }
+
+    #[monjolo_macros::tasks]
+    impl TaskDrivenUnit {
+        #[offer(key = "test.task_unit.doubled")]
+        fn doubled(&self) -> f64 {
+            self.level() * 2.0
+        }
+    }
+
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct DownstreamTaskUnit {}
+
+    #[monjolo_macros::tasks]
+    impl DownstreamTaskUnit {
+        #[need(key = "test.task_unit.doubled")]
+        #[offer(key = "test.task_unit.tripled")]
+        fn tripled(&self, doubled: f64) -> f64 {
+            doubled * 1.5
+        }
+    }
+
+    #[test]
+    fn tasks_macro_wires_two_units_across_a_needs_offers_boundary_with_no_after_declared() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[("test.task_unit.state.level", 10.0)]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+
+        let (_, needed) = registry
+            .borrow_mut()
+            .subscribe(&[], &["test.task_unit.doubled", "test.task_unit.tripled"]);
+        registry.borrow_mut().resolve().expect("chaves já ofertadas deveriam resolver de novo sem erro");
+
+        root.evaluate();
+
+        assert_eq!(
+            needed[0].get(),
+            20.0,
+            "TaskDrivenUnit::doubled deveria ler o próprio #[state] level=10.0 (seedado por \
+            #[config]) e publicar 20.0",
+        );
+        assert_eq!(
+            needed[1].get(),
+            30.0,
+            "DownstreamTaskUnit::tripled deveria ler 20.0 já publicado por TaskDrivenUnit::doubled \
+            (SEM after declarado entre as duas unidades) e publicar 30.0",
+        );
+    }
+
     /* Prova #[need(prefix = ..., components = [...])] — forma array, usada por Flows (precisa de
     composições de 8 componentes de vários subsistemas ao mesmo tempo). Mesma mecânica de
     #[offer(...)] array, só do lado "needs" de subscribe().
@@ -545,45 +666,55 @@ mod tests {
         );
     }
 
-    /* Testa `sort_by_dependency` diretamente (função privada, sem passar por inventory/macro) —
-    pergunta concreta: numa forma "diamante" (Y1 e Y2 são IRMÃOS, ambos after=["X"], sem relação
-    entre si; Z só lista after=["Y1"], NUNCA "Y2"), Z acaba mesmo depois de Y2, só porque Y2 é
-    irmão de algo que Z precisa? Ou isso não é garantido?
+    /* Testa `sort_phase_a` diretamente (função privada, sem passar por inventory/macro) — pergunta
+    concreta: numa forma "diamante" (Y1 e Y2 são IRMÃOS, ambos after=["X"], sem relação entre si; Z
+    só lista after=["Y1"], NUNCA "Y2"), Z acaba mesmo depois de Y2, só porque Y2 é irmão de algo que
+    Z precisa? Ou isso não é garantido? Continua valendo sem `needs`/`offers` populados (`&[]` pros
+    quatro) — o desempate por `after` sozinho se comporta EXATAMENTE como o sort antigo quando não
+    há grafo de dado nenhum por trás.
     */
     fn noop_construct(_: &mut StateRegistry, _: &Snapshot) -> Option<Box<dyn DynamicModel>> {
         None
     }
 
     #[test]
-    fn sort_by_dependency_does_not_guarantee_order_against_an_unlisted_sibling() {
+    fn sort_phase_a_does_not_guarantee_order_against_an_unlisted_sibling() {
         static X: ComponentDescriptor = ComponentDescriptor {
             name: "X",
             kind: ComponentKind::Dynamic,
             after: &[],
+            needs: &[],
+            offers: &[],
             construct: noop_construct,
         };
         static Y1: ComponentDescriptor = ComponentDescriptor {
             name: "Y1",
             kind: ComponentKind::Dynamic,
             after: &["X"],
+            needs: &[],
+            offers: &[],
             construct: noop_construct,
         };
         static Y2: ComponentDescriptor = ComponentDescriptor {
             name: "Y2",
             kind: ComponentKind::Dynamic,
             after: &["X"],
+            needs: &[],
+            offers: &[],
             construct: noop_construct,
         };
         static Z: ComponentDescriptor = ComponentDescriptor {
             name: "Z",
             kind: ComponentKind::Dynamic,
             after: &["Y1"], // Z NUNCA lista Y2, só Y1
+            needs: &[],
+            offers: &[],
             construct: noop_construct,
         };
 
         // Ordem adversária: Z é o PRIMEIRO candidato considerado a cada rodada, Y2 o ÚLTIMO —
         // exatamente o cenário que faz Z "furar a fila" na frente do irmão que ele não listou.
-        let sorted = sort_by_dependency(vec![&Z, &X, &Y1, &Y2]);
+        let sorted = sort_phase_a(vec![&Z, &X, &Y1, &Y2]);
         let position = |name: &str| sorted.iter().position(|d| d.name == name).unwrap();
 
         assert!(position("X") < position("Y1"), "X sempre antes de Y1 (listado)");
@@ -602,28 +733,34 @@ mod tests {
     transitividade vem de graça, mesmo listando só o vizinho imediato.
     */
     #[test]
-    fn sort_by_dependency_handles_pure_chains_transitively_for_free() {
+    fn sort_phase_a_handles_pure_chains_transitively_for_free() {
         static A: ComponentDescriptor = ComponentDescriptor {
             name: "ChainA",
             kind: ComponentKind::Dynamic,
             after: &[],
+            needs: &[],
+            offers: &[],
             construct: noop_construct,
         };
         static B: ComponentDescriptor = ComponentDescriptor {
             name: "ChainB",
             kind: ComponentKind::Dynamic,
             after: &["ChainA"],
+            needs: &[],
+            offers: &[],
             construct: noop_construct,
         };
         static C: ComponentDescriptor = ComponentDescriptor {
             name: "ChainC",
             kind: ComponentKind::Dynamic,
             after: &["ChainB"], // não lista ChainA — só o vizinho imediato
+            needs: &[],
+            offers: &[],
             construct: noop_construct,
         };
 
         // Ordem adversária: C primeiro.
-        let sorted = sort_by_dependency(vec![&C, &A, &B]);
+        let sorted = sort_phase_a(vec![&C, &A, &B]);
         let position = |name: &str| sorted.iter().position(|d| d.name == name).unwrap();
 
         assert!(position("ChainA") < position("ChainB"));
@@ -633,5 +770,108 @@ mod tests {
             de B, A acaba garantido antes de C também, de graça",
         );
         assert!(position("ChainA") < position("ChainC"));
+    }
+
+    /* Prova o caso concreto que motivou trocar `after` manual por um grafo automático de
+    `needs`/`offers`: duas tarefas de UNIDADES DIFERENTES, cada uma precisando de uma chave que a
+    OUTRA oferece (Reactor::outlet_flow precisa de "separator.pressure"; Separator::pressure
+    precisa de "reactor.temperature") — não é um ciclo de verdade porque as CHAVES não se repetem
+    (reactor.temperature != separator.pressure), só pareceria um ciclo se a ordenação fosse feita
+    no grão de "unidade inteira" em vez de "tarefa". Nenhum `after` é declarado — a ordem sai
+    inteira do casamento de chave.
+    */
+    #[test]
+    fn sort_phase_a_orders_cross_unit_tasks_by_matching_needs_to_offers_with_no_after_declared() {
+        static REACTOR_TEMPERATURE: ComponentDescriptor = ComponentDescriptor {
+            name: "Reactor::temperature",
+            kind: ComponentKind::Dynamic,
+            after: &[],
+            needs: &[],
+            offers: &["reactor.temperature"],
+            construct: noop_construct,
+        };
+        static SEPARATOR_PRESSURE: ComponentDescriptor = ComponentDescriptor {
+            name: "Separator::pressure",
+            kind: ComponentKind::Dynamic,
+            after: &[],
+            needs: &["reactor.temperature"],
+            offers: &["separator.pressure"],
+            construct: noop_construct,
+        };
+        static REACTOR_OUTLET_FLOW: ComponentDescriptor = ComponentDescriptor {
+            name: "Reactor::outlet_flow",
+            kind: ComponentKind::Dynamic,
+            after: &[],
+            needs: &["separator.pressure"],
+            offers: &["flows.stream7"],
+            construct: noop_construct,
+        };
+
+        // Ordem adversária: outlet_flow primeiro, temperature por último.
+        let sorted = sort_phase_a(vec![&REACTOR_OUTLET_FLOW, &SEPARATOR_PRESSURE, &REACTOR_TEMPERATURE]);
+        let position = |name: &str| sorted.iter().position(|d| d.name == name).unwrap();
+
+        assert!(
+            position("Reactor::temperature") < position("Separator::pressure"),
+            "Separator::pressure precisa de reactor.temperature",
+        );
+        assert!(
+            position("Separator::pressure") < position("Reactor::outlet_flow"),
+            "Reactor::outlet_flow precisa de separator.pressure",
+        );
+    }
+
+    /* Contraste com o teste acima: um ciclo REAL (A precisa do que B oferece, B precisa do que A
+    oferece) deve travar o bootstrap com uma mensagem clara, nunca ser silenciosamente despejado
+    numa ordem arbitrária (comportamento antigo) nem deixado pra `StateRegistry::resolve()`
+    detectar — `resolve()` não consegue: as duas chaves TÊM ofertante, só não em ordem executável.
+    */
+    #[test]
+    #[should_panic(expected = "ciclo real de dependência")]
+    fn sort_phase_a_panics_on_a_real_cycle() {
+        static A: ComponentDescriptor = ComponentDescriptor {
+            name: "A",
+            kind: ComponentKind::Dynamic,
+            after: &[],
+            needs: &["b.output"],
+            offers: &["a.output"],
+            construct: noop_construct,
+        };
+        static B: ComponentDescriptor = ComponentDescriptor {
+            name: "B",
+            kind: ComponentKind::Dynamic,
+            after: &[],
+            needs: &["a.output"],
+            offers: &["b.output"],
+            construct: noop_construct,
+        };
+
+        sort_phase_a(vec![&A, &B]);
+    }
+
+    /* Duas chaves iguais ofertadas por descritores diferentes é bug de programação (não dado de
+    usuário em runtime) — precisa travar o bootstrap, não sobrescrever um índice silenciosamente.
+    */
+    #[test]
+    #[should_panic(expected = "ofertada por dois componentes")]
+    fn sort_phase_a_panics_on_duplicate_offer() {
+        static A: ComponentDescriptor = ComponentDescriptor {
+            name: "A",
+            kind: ComponentKind::Dynamic,
+            after: &[],
+            needs: &[],
+            offers: &["duplicated.key"],
+            construct: noop_construct,
+        };
+        static B: ComponentDescriptor = ComponentDescriptor {
+            name: "B",
+            kind: ComponentKind::Dynamic,
+            after: &[],
+            needs: &[],
+            offers: &["duplicated.key"],
+            construct: noop_construct,
+        };
+
+        sort_phase_a(vec![&A, &B]);
     }
 }

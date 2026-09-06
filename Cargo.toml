@@ -34,6 +34,12 @@ inventory = "0.3"
 # genérico. O resto do crate não sabe nada disso.
 opcua = ["dep:opcua", "dep:tokio"]
 
+# Correlações termodinâmicas de mistura (monjolo::chemistry — entalpia, Antoine, densidade
+# líquida, Newton-Raphson) — matemática genérica, sem dependência externa nenhuma, mas ainda
+# assim opcional: nem toda planta simulada com monjolo é um processo químico (ex.: o próprio
+# exemplo de decaimento exponencial dos testes do framework).
+chemistry = []
+
 # required-features: sem isso, `cargo build`/`cargo test` sem --features opcua tentam compilar o
 # exemplo mesmo assim (target de exemplo é compilado por padrão) e falham — opcua_browse.rs usa
 # opcua::client/tokio::main, só existem com a feature ligada.

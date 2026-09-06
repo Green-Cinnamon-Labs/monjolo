@@ -59,13 +59,17 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{Fields, Ident, Type};
 
-enum FieldKeySpec {
+/* `pub(crate)`: reaproveitado por `tasks.rs` (`#[monjolo::tasks]`) pra parsear `#[need(...)]`/
+`#[offer(...)]` em MÉTODOS com a mesma gramática já usada em CAMPOS aqui — mesmo conceito
+("escalar" ou "array de N componentes"), dois pontos de anexação diferentes.
+*/
+pub(crate) enum FieldKeySpec {
     Scalar(String),
     Array(String, Vec<String>),
 }
 
 impl FieldKeySpec {
-    fn keys(&self) -> Vec<String> {
+    pub(crate) fn keys(&self) -> Vec<String> {
         match self {
             FieldKeySpec::Scalar(key) => vec![key.clone()],
             FieldKeySpec::Array(prefix, components) => {
@@ -105,8 +109,8 @@ enum FieldShapeKind {
 }
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let after = match parse_after_arg(attr) {
-        Ok(after) => after,
+    let DynamicModelArgs { after, tasks } = match parse_dynamic_model_args(attr) {
+        Ok(args) => args,
         Err(err) => return err.to_compile_error().into(),
     };
 
@@ -212,6 +216,20 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let offer_refs = quote! { &[#(#offer_key_strs),*] };
     let need_refs = quote! { &[#(#need_key_strs),*] };
 
+    /* `tasks` (`#[dynamic_model(tasks)]`) diz que esta unidade não tem `compute()` nenhum — toda a
+    física dela mora em métodos do próprio `impl #struct_name` anotados por `#[monjolo::tasks]`
+    (arquivo separado, que esta macro não enxerga — ver comentário de `#[monjolo::tasks]`). Nesse
+    caso, `evaluate()` gerado aqui vira no-op: quem de fato avança a física são as tarefas, cada
+    uma seu próprio `ComponentDescriptor`/`DynamicModel`, chamando de volta nesta instância (via
+    `registry.instance::<#struct_name>(...)`, ver `offer_instance` abaixo). Sem `tasks`,
+    comportamento idêntico a sempre: `evaluate()` chama o `compute()` que o usuário escreve à mão.
+    */
+    let evaluate_body = if tasks {
+        quote! {}
+    } else {
+        quote! { self.compute(); }
+    };
+
     let expanded = quote! {
         #visibility struct #struct_name {
             #(#struct_fields),*
@@ -225,25 +243,29 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             `#[need(...)]` declarados nos campos, na ordem em que aparecem na struct — mesma
             mecânica que `Reactor::new()`/`Separator::new()`/etc. já faziam à mão (`offer_keys:
             Vec<String>` montado antes, um `subscribe()` só). `#[config(...)]` semeia os campos
-            correspondentes logo em seguida, antes de `Self` existir.
+            correspondentes logo em seguida, antes de `Self` existir. Devolve `Rc<Self>` (não
+            `Self`) e já se registra no catálogo de instâncias da StateRegistry sob o próprio nome
+            do tipo — ver `monjolo-macros/dynamic_model.rs` pra detalhes.
             */
             pub fn new(
                 registry: &mut ::monjolo::state_registry::StateRegistry,
                 config: &::monjolo::snapshot::Snapshot,
-            ) -> Self {
+            ) -> ::std::rc::Rc<Self> {
                 let (__offered, __needed) = registry.subscribe(#offer_refs, #need_refs);
                 #(#config_seed_stmts)*
 
-                Self {
+                let __instance = ::std::rc::Rc::new(Self {
                     #(#field_inits),*
-                }
+                });
+                registry.offer_instance(::std::stringify!(#struct_name), __instance.clone());
+                __instance
             }
         }
 
-        /** Gerado por `#[dynamic_model]` — `evaluate()` só chama `compute()` (método inerente que
-        o usuário escreve à mão em `impl #struct_name`, nunca aqui); `state_keys()` vem dos campos
-        `#[config]`+`#[offer]` ("own_state"), coletados durante a expansão — impossível declarar
-        um sem o outro passar a existir também.
+        /** Gerado por `#[dynamic_model]` — `evaluate()` chama `compute()` (método inerente que o
+        usuário escreve à mão em `impl #struct_name`, nunca aqui), ou nada, se `tasks` estiver
+        declarado. `state_keys()` vem dos campos `#[config]`+`#[offer]`+`#[state]`, coletados
+        durante a expansão — impossível declarar um sem o outro passar a existir também.
         */
         impl ::monjolo::dynamic_model::DynamicModel for #struct_name {
             fn name(&self) -> &str {
@@ -251,7 +273,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             fn evaluate(&self) {
-                self.compute();
+                #evaluate_body
             }
 
             fn state_keys(&self) -> ::std::vec::Vec<::std::string::String> {
@@ -261,14 +283,19 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         /* Anúncio escondido pro bootstrap de Simulation — fase (A). `after` (se declarado no
         atributo, `#[dynamic_model(after = ["Outro"])]`) diz a `attach_discovered_components` pra
-        ordenar esta struct depois de outra(s), pelo nome — só importa quando um componente desta
-        fase depende do resultado de outro NO MESMO tick (ver monjolo::component).
+        ordenar esta struct depois de outra(s), pelo nome. `needs`/`offers` vêm dos mesmos campos
+        `#[need(...)]`/`#[offer(...)]` já coletados acima — junto com o `after` continuam
+        funcionando como desempate/ordem estrutural, mas agora o grafo de dependência real entre
+        componentes da fase (A) é inferido automaticamente casando estas chaves (ver
+        `monjolo::component::sort_phase_a`).
         */
         ::monjolo::inventory::submit! {
             ::monjolo::ComponentDescriptor {
                 name: ::std::stringify!(#struct_name),
                 kind: ::monjolo::ComponentKind::Dynamic,
                 after: &[#(#after),*],
+                needs: #need_refs,
+                offers: #offer_refs,
                 construct: |registry: &mut ::monjolo::state_registry::StateRegistry, config: &::monjolo::snapshot::Snapshot| {
                     ::std::option::Option::Some(
                         ::std::boxed::Box::new(#struct_name::new(registry, config))
@@ -323,7 +350,7 @@ fn setter_tokens(ident: &Ident, n: Option<usize>) -> TokenStream2 {
 de Proxy) a partir de `start`/`len` — escalar clona um índice, array clona `len` índices num
 array literal.
 */
-fn field_init_from_slice(ident: &Ident, source: &str, start: usize, len: usize, n: Option<usize>) -> TokenStream2 {
+pub(crate) fn field_init_from_slice(ident: &Ident, source: &str, start: usize, len: usize, n: Option<usize>) -> TokenStream2 {
     let source = format_ident!("{}", source);
     match n {
         None => {
@@ -485,32 +512,51 @@ fn field_shape(ty: &Type) -> syn::Result<FieldShape> {
     }
 }
 
-/* Parseia o argumento do PRÓPRIO #[dynamic_model(...)] (não de um campo) — só aceita `after =
-[...]`, opcional; vazio (`vec![]`) se o atributo não recebeu nada (`#[dynamic_model]` puro).
+struct DynamicModelArgs {
+    after: Vec<String>,
+    /* `#[dynamic_model(tasks)]` — flag sem valor, não `name = value`. Ver comentário de
+    `evaluate_body` em `expand()`.
+    */
+    tasks: bool,
+}
+
+/* Parseia o argumento do PRÓPRIO #[dynamic_model(...)] (não de um campo) — aceita `after = [...]`
+e/ou `tasks` (flag), em qualquer ordem, ambos opcionais; vazio/`false` se o atributo não recebeu
+nada (`#[dynamic_model]` puro).
 */
-fn parse_after_arg(attr: TokenStream) -> syn::Result<Vec<String>> {
+fn parse_dynamic_model_args(attr: TokenStream) -> syn::Result<DynamicModelArgs> {
     if attr.is_empty() {
-        return Ok(Vec::new());
+        return Ok(DynamicModelArgs { after: Vec::new(), tasks: false });
     }
 
-    let pairs = {
+    let metas = {
         use syn::parse::Parser;
-        syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated.parse(attr)?
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated.parse(attr)?
     };
 
     let mut after = None;
-    for pair in &pairs {
-        if pair.path.is_ident("after") {
-            after = Some(expect_str_array(&pair.value)?);
-        } else {
-            return Err(syn::Error::new_spanned(&pair.path, "esperado `after`"));
+    let mut tasks = false;
+    for meta in &metas {
+        match meta {
+            syn::Meta::NameValue(pair) if pair.path.is_ident("after") => {
+                after = Some(expect_str_array(&pair.value)?);
+            }
+            syn::Meta::Path(path) if path.is_ident("tasks") => {
+                if tasks {
+                    return Err(syn::Error::new_spanned(path, "`tasks` repetido"));
+                }
+                tasks = true;
+            }
+            other => {
+                return Err(syn::Error::new_spanned(other, "esperado `after = [...]` ou `tasks`"));
+            }
         }
     }
 
-    Ok(after.unwrap_or_default())
+    Ok(DynamicModelArgs { after: after.unwrap_or_default(), tasks })
 }
 
-fn parse_key_spec(attr: &syn::Attribute) -> syn::Result<FieldKeySpec> {
+pub(crate) fn parse_key_spec(attr: &syn::Attribute) -> syn::Result<FieldKeySpec> {
     let pairs = attr.parse_args_with(
         syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated,
     )?;
@@ -544,14 +590,14 @@ fn parse_key_spec(attr: &syn::Attribute) -> syn::Result<FieldKeySpec> {
     }
 }
 
-fn expect_str_lit(expr: &syn::Expr) -> syn::Result<String> {
+pub(crate) fn expect_str_lit(expr: &syn::Expr) -> syn::Result<String> {
     match expr {
         syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => Ok(s.value()),
         other => Err(syn::Error::new_spanned(other, "esperada uma string literal")),
     }
 }
 
-fn expect_str_array(expr: &syn::Expr) -> syn::Result<Vec<String>> {
+pub(crate) fn expect_str_array(expr: &syn::Expr) -> syn::Result<Vec<String>> {
     match expr {
         syn::Expr::Array(array) => array.elems.iter().map(expect_str_lit).collect(),
         other => Err(syn::Error::new_spanned(other, "esperado um array de strings, ex.: [\"a\", \"b\"]")),
