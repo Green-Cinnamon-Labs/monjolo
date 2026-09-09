@@ -28,12 +28,14 @@ bloqueia em `events_rx.recv()`.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::adapter::AdapterConfig;
 use crate::dynamic_model::{Composite, CompositeDynamicModel, DynamicModel};
 use crate::numerical_method::NumericalMethod;
+use crate::runtime_control::RuntimeControl;
 use crate::snapshot::Snapshot;
 use crate::state_registry::{Proxy, StateRegistry};
 
@@ -78,6 +80,7 @@ pub struct Simulation {
     dt_hours: f64,
     numerical_method: NumericalMethod,
     adapter: Option<AdapterConfig>,
+    runtime_control: Arc<RuntimeControl>,
 }
 
 impl Default for Simulation {
@@ -89,6 +92,7 @@ impl Default for Simulation {
             dt_hours: 1.0 / 3600.0,
             numerical_method: NumericalMethod::default(),
             adapter: None,
+            runtime_control: Arc::new(RuntimeControl::new()),
         }
     }
 }
@@ -131,6 +135,16 @@ impl Simulation {
     */
     pub fn set_adapter(&mut self, adapter: AdapterConfig) {
         self.adapter = Some(adapter);
+    }
+
+    /** Devolve um clone do `Arc<RuntimeControl>` desta `Simulation` — chame ANTES de `run()` (que
+    consome `self` por valor): a mesma instância acompanha a Thread da planta por dentro (lida a
+    cada tick) e pode ser passada pra fora, pra quem monta um adapter (ex.:
+    `AdapterConfig::OpcUa { control: simulation.runtime_control(), .. }`), sem duplicar estado —
+    pausar/mudar velocidade por uma ponta é visível pela outra imediatamente, mesmo `Arc`.
+    */
+    pub fn runtime_control(&self) -> Arc<RuntimeControl> {
+        self.runtime_control.clone()
     }
 
     /** Caminho do arquivo de configuração (condição inicial, análogo a `application.yaml` do
@@ -230,6 +244,7 @@ impl Simulation {
         let numerical_method = self.numerical_method;
         let config_path = self.config_path.take();
         let adapter = self.adapter.take();
+        let runtime_control = self.runtime_control.clone();
 
         let (events_tx, events_rx) = std::sync::mpsc::channel::<ServiceEvent>();
 
@@ -240,6 +255,7 @@ impl Simulation {
             dt_hours,
             numerical_method,
             adapter,
+            runtime_control,
             events_tx,
         );
 
@@ -276,6 +292,7 @@ impl Simulation {
         dt_hours: f64,
         numerical_method: NumericalMethod,
         adapter: Option<AdapterConfig>,
+        runtime_control: Arc<RuntimeControl>,
         events: Sender<ServiceEvent>,
     ) -> JoinHandle<()> {
         std::thread::Builder::new()
@@ -346,6 +363,8 @@ impl Simulation {
                         o último tick (ver comentário acima do `spawn_adapter_thread`) — ponto
                         único e determinístico de aplicação, sempre antes da física deste tick.
                         `Rc<dyn Actuator>` nunca sai desta thread: só o nome/valor atravessou.
+                        Drenado mesmo pausado — um comando escrito durante a pausa já fica aplicado
+                        pra quando a simulação retomar, em vez de se perder.
                         */
                         if let Some(rx) = &command_rx {
                             while let Ok((name, value)) = rx.try_recv() {
@@ -359,6 +378,27 @@ impl Simulation {
                                     ),
                                 }
                             }
+                        }
+
+                        /* Fator de velocidade escala só o ritmo de PAREDE (`tick_interval`) — nunca
+                        `dt_hours` (Art. 1 do topo do arquivo: os dois são independentes de
+                        propósito). 0.0 = o mais rápido possível (sem dormir); negativo já vira 0.0
+                        dentro de `RuntimeControl::set_speed`.
+                        */
+                        let speed = runtime_control.speed();
+                        let effective_interval = if speed <= 0.0 {
+                            Duration::ZERO
+                        } else {
+                            tick_interval.div_f64(speed)
+                        };
+
+                        if runtime_control.is_paused() {
+                            /* Pausado: física congelada — nem evaluate() roda, nem commit(), nem
+                            t_h avança. Só dorme e tenta de novo — comandos de atuador continuam
+                            sendo drenados acima, então retomar já aplica o que chegou entretanto.
+                            */
+                            std::thread::sleep(tick_interval);
+                            continue;
                         }
 
                         if state_proxies.is_empty() {
@@ -396,8 +436,9 @@ impl Simulation {
                         }
 
                         registry.borrow_mut().commit();
+                        runtime_control.advance_t_h(dt_hours);
 
-                        std::thread::sleep(tick_interval);
+                        std::thread::sleep(effective_interval);
                     }
                 }));
 
@@ -437,7 +478,12 @@ impl Simulation {
         adapter: Option<AdapterConfig>,
         registry: &std::rc::Rc<std::cell::RefCell<StateRegistry>>,
     ) -> Option<std::sync::mpsc::Receiver<(String, f64)>> {
-        let AdapterConfig::OpcUa { endpoint } = adapter?;
+        /* `control`: o MESMO `Arc<RuntimeControl>` que `Simulation::runtime_control()` devolveu —
+        quem monta o `AdapterConfig::OpcUa` (ex.: `tep-plant/src/main.rs`) é responsável por passar
+        essa mesma instância, não uma nova (ver comentário em `adapter/mod.rs`); não há como o
+        compilador forçar isso, só documentar o contrato.
+        */
+        let AdapterConfig::OpcUa { endpoint, control } = adapter?;
 
         let sensors: std::collections::HashMap<String, std::sync::Arc<dyn crate::sensor::Sensor>> =
             registry
@@ -485,6 +531,7 @@ impl Simulation {
                     sensors,
                     actuators,
                     command_tx,
+                    control,
                     &endpoint,
                 ));
                 if let Err(err) = outcome {

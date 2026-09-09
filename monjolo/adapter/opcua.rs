@@ -26,6 +26,16 @@ o mesmo truque de sempre: quem chama `serve()` (`Simulation::spawn_adapter_threa
 no `StateRegistry` (aqui, o próprio `#[state]` do atuador), então herda de graça o mesmo caminho
 `Send + Sync` que os sensores de verdade já usam. Sem isso, o node ficava travado no valor inicial
 pra sempre: só o write callback existia, nada nunca publicava a posição de volta.
+
+`control: Arc<RuntimeControl>` (Send+Sync de verdade, só atomics por dentro — `runtime_control.rs`)
+vira dois tipos de node, nenhum deles bridgeado por canal (diferente do write de atuador acima):
+`clock.t_h` é só mais um node read-only na lista de push — `RuntimeControl` implementa `Sensor`
+direto (`fn read(&self) -> f64 { self.t_h() }`), então entra em `push_nodes` como qualquer sensor de
+verdade. `control.pause`/`control.resume`/`control.set_speed` viram `Method` nodes (`Call`, não
+`Read`/`Write`) — cada callback chama o método correspondente de `RuntimeControl` diretamente, sem
+canal: `RuntimeControl` não precisa da ponte que `Actuator` precisa porque já é `Send + Sync` por
+inteiro, não só uma leitura-espelho dele. `reset` ainda não tem Method — ver nota em
+`runtime_control.rs`.
 */
 
 use std::collections::HashMap;
@@ -34,12 +44,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opcua::crypto::SecurityPolicy;
-use opcua::server::address_space::{AccessLevel, Variable};
+use opcua::server::address_space::{AccessLevel, MethodBuilder, Variable};
 use opcua::server::diagnostics::NamespaceMetadata;
 use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
 use opcua::server::ServerBuilder;
-use opcua::types::{DataValue, MessageSecurityMode, NodeId, NumericRange, StatusCode};
+use opcua::types::{
+    DataTypeId, DataValue, MessageSecurityMode, NodeId, NumericRange, StatusCode, Variant,
+};
 
+use crate::runtime_control::RuntimeControl;
 use crate::sensor::Sensor;
 
 const NAMESPACE_URI: &str = "urn:monjolo:opcua-adapter";
@@ -58,7 +71,9 @@ const APPLICATION_URI: &str = "urn:monjolo:opcua-adapter:app";
 /** Sobe um servidor OPC-UA: um node read-only por sensor em `sensors` (lido via `sensor.read()` a
 cada tick — já passa pelo `SensorBehavior` do próprio sensor), um node read-write por nome em
 `actuators` (lido via o `Sensor` espelho associado, escrito via `commands` — quem tem acesso de
-verdade ao `Actuator` é a Thread da planta, nunca esta).
+verdade ao `Actuator` é a Thread da planta, nunca esta), mais um node read-only `clock.t_h` e três
+`Method` (`control.pause`/`control.resume`/`control.set_speed`) a partir de `control` — ver nota no
+topo do arquivo.
 
 `endpoint` no formato `opc.tcp://<host>:<porta><path>`, ex.: `"opc.tcp://0.0.0.0:4840/tep/server/"`.
 
@@ -68,6 +83,7 @@ pub async fn serve(
     sensors: HashMap<String, Arc<dyn Sensor>>,
     actuators: HashMap<String, Arc<dyn Sensor>>,
     commands: Sender<(String, f64)>,
+    control: Arc<RuntimeControl>,
     endpoint: &str,
 ) -> Result<(), String> {
     let (host, port, path) = parse_endpoint(endpoint)?;
@@ -170,6 +186,68 @@ pub async fn serve(
 
             push_nodes.push((node_id, shadow_sensor));
         }
+
+        /* `RuntimeControl` implementa `Sensor` (runtime_control.rs) só pra expor `t_h` — entra na
+        mesma lista de push que qualquer sensor de verdade, sem node manager/loop dedicado.
+        */
+        let clock_id = NodeId::new(ns, "clock.t_h");
+        let _ = address_space.add_variables(
+            vec![Variable::new(&clock_id, "clock.t_h", "clock.t_h", 0f64)],
+            &folder_id,
+        );
+        push_nodes.push((clock_id, control.clone() as Arc<dyn Sensor>));
+
+        /* Três Method (`Call`, não `Read`/`Write`) — cada callback chama `RuntimeControl`
+        diretamente, sem canal: diferente da escrita de atuador acima, `RuntimeControl` já é
+        `Send + Sync` por inteiro (só atomics por dentro), não uma leitura-espelho de algo `!Send`
+        que precisa ser aplicado de volta na Thread da planta. `reset` fica de fora por enquanto —
+        ver nota em `runtime_control.rs`.
+        */
+        let pause_id = NodeId::new(ns, "control.pause");
+        MethodBuilder::new(&pause_id, "control.pause", "control.pause")
+            .component_of(folder_id.clone())
+            .insert(&mut *address_space);
+        let control_for_pause = control.clone();
+        node_manager
+            .inner()
+            .add_method_callback(pause_id, move |_args: &[Variant]| {
+                control_for_pause.pause();
+                Ok(Vec::new())
+            });
+
+        let resume_id = NodeId::new(ns, "control.resume");
+        MethodBuilder::new(&resume_id, "control.resume", "control.resume")
+            .component_of(folder_id.clone())
+            .insert(&mut *address_space);
+        let control_for_resume = control.clone();
+        node_manager
+            .inner()
+            .add_method_callback(resume_id, move |_args: &[Variant]| {
+                control_for_resume.resume();
+                Ok(Vec::new())
+            });
+
+        let speed_id = NodeId::new(ns, "control.set_speed");
+        let speed_args_id = NodeId::new(ns, "control.set_speed.InputArguments");
+        MethodBuilder::new(&speed_id, "control.set_speed", "control.set_speed")
+            .component_of(folder_id.clone())
+            .input_args(
+                &mut *address_space,
+                &speed_args_id,
+                &[("factor", DataTypeId::Double).into()],
+            )
+            .insert(&mut *address_space);
+        let control_for_speed = control.clone();
+        node_manager
+            .inner()
+            .add_method_callback(speed_id, move |args: &[Variant]| {
+                let factor = args
+                    .first()
+                    .and_then(Variant::as_f64)
+                    .ok_or(StatusCode::BadInvalidArgument)?;
+                control_for_speed.set_speed(factor);
+                Ok(Vec::new())
+            });
 
         push_nodes
     };

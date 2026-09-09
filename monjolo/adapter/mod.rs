@@ -13,6 +13,12 @@ Não existe mais nenhuma ponte própria aqui, nem de leitura nem de escrita
 #[cfg(feature = "opcua")]
 pub mod opcua;
 
+#[cfg(feature = "opcua")]
+use std::sync::Arc;
+
+#[cfg(feature = "opcua")]
+use crate::runtime_control::RuntimeControl;
+
 /** Infraestrutura externa que `Simulation::run()` pode subir numa thread própria — mesmo raciocínio
 de `NumericalMethod` (numerical_method/mod.rs): um enum fechado, não um trait object aberto —
 `Simulation` só aceita o que o framework já implementa aqui dentro.
@@ -23,6 +29,13 @@ valor nenhum pra passar pra ele).
 */
 #[derive(Debug)]
 pub enum AdapterConfig {
+    /* `control`: mesmo `Arc<RuntimeControl>` que `Simulation::runtime_control()` devolve — quem
+    monta o adapter (ex.: `tep-plant/src/main.rs`) passa a MESMA instância que também vai pra dentro
+    da Thread da planta, não uma cópia independente (`RuntimeControl` não tem "duas fontes da
+    verdade": um único `Arc` compartilhado nos dois sentidos). */
     #[cfg(feature = "opcua")]
-    OpcUa { endpoint: String },
+    OpcUa {
+        endpoint: String,
+        control: Arc<RuntimeControl>,
+    },
 }
