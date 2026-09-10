@@ -13,10 +13,12 @@ Diferente de `Sensor`/`Actuator`: não é algo que o usuário do framework decla
 `#[runtime_control(...)]`) — existe exatamente um por `Simulation`, então não precisa do mecanismo de
 catálogo/`inventory` que sensores/atuadores usam.
 
-NOTA: `reset` ainda não tem Method OPC-UA nem tratamento na Thread da planta — `request_reset()`/
-`take_reset_request()` existem como interface, mas reconstruir o modelo/estado físico do zero exige
-que `model_factory` (hoje `FnOnce`, `simulation.rs`) vire re-invocável, uma mudança maior, ainda em
-aberto (ver discussão da issue #61/#66).
+NOTA (2026-09-09, issue #67): `request_reset()`/`take_reset_request()` agora são consumidos de
+verdade — o loop de tick de `spawn_plant_thread` (`simulation.rs`) chama `take_reset_request()` a
+cada iteração e encerra a Thread da planta quando `true`. Quem decide o que "reset" significa de
+verdade (construir uma `Simulation` nova e trocar o `PlantBinding` que um adaptador enxerga) é
+`crate::runtime::Runtime::reset()`, não esta struct — `RuntimeControl` só carrega o pedido até a
+Thread da planta atual, uma vez por instância; é descartado junto dela.
 */
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -96,9 +98,7 @@ impl RuntimeControl {
     // ── Chamado só pela Thread da planta, dentro de spawn_plant_thread ──
 
     /** Consome o pedido de reset — chamado no máximo uma vez por tick pela Thread da planta; troca
-    por `false` atomicamente, então duas leituras nunca consomem o mesmo pedido duas vezes.
-    `#[allow(dead_code)]`: nada chama isto ainda (ver nota no topo do arquivo). */
-    #[allow(dead_code)]
+    por `false` atomicamente, então duas leituras nunca consomem o mesmo pedido duas vezes. */
     pub(crate) fn take_reset_request(&self) -> bool {
         self.reset_requested.swap(false, Ordering::Relaxed)
     }

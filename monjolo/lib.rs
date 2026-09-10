@@ -17,6 +17,7 @@ pub mod controller;
 pub mod disturbance;
 pub mod dynamic_model;
 pub mod numerical_method;
+pub mod runtime;
 pub mod runtime_control;
 pub mod sensor;
 pub mod simulation;

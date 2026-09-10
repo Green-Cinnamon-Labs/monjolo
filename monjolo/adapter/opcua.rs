@@ -1,45 +1,44 @@
 /** src/adapter/opcua.rs
 
 Adaptador OPC-UA genérico: expõe sensores/atuadores via um servidor OPC-UA mínimo. Não sabe nada de
-TEP/química/planta específica, nem de `Simulation`/`StateRegistry` — só recebe um catálogo de
-`Arc<dyn Sensor>` (leitura, por nome) e uma lista de nomes de atuador, que a "Thread da planta" já
-resolveu. Quem chama essa função é `Simulation::run()` (`spawn_plant_thread`), nunca o usuário do
-framework direto.
+TEP/química/planta específica, nem de `StateRegistry` — só de `crate::runtime::Runtime`, o supervisor
+persistente (issue #67) que troca atomicamente pra qual `PlantBinding` (sensores, atuadores-espelho,
+canal de comando, `RuntimeControl`) está "ativo agora".
 
 Requer a feature `opcua` — puxa async-opcua + tokio, pesados demais pra serem dependência default do
 resto do crate.
 
+NOTA (2026-09-09, issue #67): antes desta issue, `serve()` recebia `(sensors, actuators, commands,
+control)` UMA vez e os capturava pra sempre — correto enquanto só existia uma `Simulation` pelo tempo
+de vida inteiro do processo. Agora que `Runtime::reset()` descarta a `Simulation` atual e sobe outra
+do zero, aqueles quatro valores mudam de identidade a cada reset (novos `Arc<dyn Sensor>`, novo
+`Sender`, novo `Arc<RuntimeControl>`) — capturar UMA vez faria todo Read/Write/Method continuar
+apontando pra uma planta morta depois do primeiro reset. Por isso todo callback abaixo (o loop de
+push periódico, o write callback de atuador, os Methods de controle) chama `runtime.binding()`
+FRESCO a cada execução, nunca guarda o `Arc<PlantBinding>` de uma vez pra outra. A ESTRUTURA de nodes
+(quais NodeId existem) continua construída uma única vez, no boot — os nomes de sensor/atuador são
+estáveis entre resets (mesmas chaves sempre), só o que está por trás de cada nome muda.
+
 Sensores viram nodes read-only, atualizados por push (`set_values`) a cada tick, chamando
-`sensor.read()` direto em cada `Arc<dyn Sensor>` — o mesmo objeto catalogado em `StateRegistry`,
-compartilhado (não copiado). `Sensor` é `Send + Sync` de verdade (`ReadProxy` usa `Arc<AtomicUsize>`),
-então atravessa pra esta thread sem bridge nenhuma: `Sensor::read()` já garante, sozinho, que duas
-leituras dentro da mesma `generation` de `CurrentState` devolvem o mesmo valor.
+`sensor.read()` no `Arc<dyn Sensor>` que a leitura FRESCA de `runtime.binding()` devolver pro nome
+daquele node — `Sensor` é `Send + Sync` de verdade, então atravessa sem bridge nenhuma.
 
 Atuadores viram um único node por nome, writable E atualizado por push — as duas coisas. `Actuator`
-em si NÃO atravessa — guarda `Proxy` (`Rc`-based), `!Send`/`!Sync` por construção, e isso não muda
-aqui (mudar seria tocar o caminho mais quente do framework, lido/escrito em todo sub-passo do RK4).
-A ESCRITA (comando entrando) continua pelo canal: cada node manda `(nome, valor)` por `commands` —
-um `std::sync::mpsc::Sender` clonado por node — pra Thread da planta, que drena e chama
-`actuator.write()` localmente, sem que nenhum `Rc` cruze a fronteira. A LEITURA (posição saindo) usa
-o mesmo truque de sempre: quem chama `serve()` (`Simulation::spawn_adapter_thread`) constrói um
-`Sensor` "espelho" na MESMA chave pra cada atuador — `Sensor` só lê de volta um valor que já existe
-no `StateRegistry` (aqui, o próprio `#[state]` do atuador), então herda de graça o mesmo caminho
-`Send + Sync` que os sensores de verdade já usam. Sem isso, o node ficava travado no valor inicial
-pra sempre: só o write callback existia, nada nunca publicava a posição de volta.
+em si NÃO atravessa — guarda `Proxy` (`Rc`-based), `!Send`/`!Sync` por construção. A ESCRITA (comando
+entrando) vai pelo canal `commands` do `PlantBinding` ATUAL (lido fresco no momento do Write, não
+capturado no registro do callback) pra Thread da planta viva, que drena e chama `actuator.write()`
+localmente. A LEITURA (posição saindo) usa o `Sensor` espelho do `PlantBinding` atual, na mesma
+chave.
 
-`control: Arc<RuntimeControl>` (Send+Sync de verdade, só atomics por dentro — `runtime_control.rs`)
-vira dois tipos de node, nenhum deles bridgeado por canal (diferente do write de atuador acima):
 `clock.t_h` é só mais um node read-only na lista de push — `RuntimeControl` implementa `Sensor`
-direto (`fn read(&self) -> f64 { self.t_h() }`), então entra em `push_nodes` como qualquer sensor de
-verdade. `control.pause`/`control.resume`/`control.set_speed` viram `Method` nodes (`Call`, não
-`Read`/`Write`) — cada callback chama o método correspondente de `RuntimeControl` diretamente, sem
-canal: `RuntimeControl` não precisa da ponte que `Actuator` precisa porque já é `Send + Sync` por
-inteiro, não só uma leitura-espelho dele. `reset` ainda não tem Method — ver nota em
-`runtime_control.rs`.
+direto (`fn read(&self) -> f64 { self.t_h() }`). `control.pause`/`control.resume`/`control.set_speed`
+viram `Method` (`Call`), cada callback resolvendo `runtime.binding().control` fresco antes de agir.
+`control.reset`/`control.shutdown` são dois Methods novos que chamam direto em `Runtime` (não em
+`RuntimeControl` — não há uma instância de `RuntimeControl` que sobreviva a um reset pra chamar isso
+nela) — cada um roda `Runtime::reset()`/`request_shutdown()` (bloqueantes) dentro do seu próprio
+`std::thread::spawn`, pra nunca travar o runtime tokio de thread única deste adaptador.
 */
 
-use std::collections::HashMap;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,7 +51,7 @@ use opcua::types::{
     DataTypeId, DataValue, MessageSecurityMode, NodeId, NumericRange, StatusCode, Variant,
 };
 
-use crate::runtime_control::RuntimeControl;
+use crate::runtime::Runtime;
 use crate::sensor::Sensor;
 
 const NAMESPACE_URI: &str = "urn:monjolo:opcua-adapter";
@@ -68,24 +67,19 @@ node, por isso "funciona" enquanto Read/Write silenciosamente não.
 */
 const APPLICATION_URI: &str = "urn:monjolo:opcua-adapter:app";
 
-/** Sobe um servidor OPC-UA: um node read-only por sensor em `sensors` (lido via `sensor.read()` a
-cada tick — já passa pelo `SensorBehavior` do próprio sensor), um node read-write por nome em
-`actuators` (lido via o `Sensor` espelho associado, escrito via `commands` — quem tem acesso de
-verdade ao `Actuator` é a Thread da planta, nunca esta), mais um node read-only `clock.t_h` e três
-`Method` (`control.pause`/`control.resume`/`control.set_speed`) a partir de `control` — ver nota no
-topo do arquivo.
+/** Sobe um servidor OPC-UA: um node read-only por sensor, um node read-write por atuador, mais
+`clock.t_h` (read-only) e cinco `Method` (`control.pause`/`resume`/`set_speed`/`reset`/`shutdown`) —
+todos resolvidos contra `runtime.binding()` fresco a cada execução, nunca contra uma planta fixa (ver
+nota no topo do arquivo).
 
 `endpoint` no formato `opc.tcp://<host>:<porta><path>`, ex.: `"opc.tcp://0.0.0.0:4840/tep/server/"`.
 
-Bloqueia até o servidor encerrar (erro fatal — não há shutdown gracioso ainda).
+Bloqueia até o servidor encerrar (normalmente: nunca de propósito — `control.shutdown` não fecha
+este servidor TCP diretamente, para a planta e sinaliza `Runtime::wait_for_shutdown()`; é o
+`main()` de quem monta o processo, retornando logo depois disso, que acaba encerrando esta thread
+junto ao resto do processo — ver `Runtime::request_shutdown`).
 */
-pub async fn serve(
-    sensors: HashMap<String, Arc<dyn Sensor>>,
-    actuators: HashMap<String, Arc<dyn Sensor>>,
-    commands: Sender<(String, f64)>,
-    control: Arc<RuntimeControl>,
-    endpoint: &str,
-) -> Result<(), String> {
+pub async fn serve(runtime: Arc<Runtime>, endpoint: &str) -> Result<(), String> {
     let (host, port, path) = parse_endpoint(endpoint)?;
     /* `discovery_urls` precisa de URL completa (`opc.tcp://host:porta/caminho`), não só o path —
     server.rs::base_endpoint() usa isso pra construir o `EndpointUrl` que devolve em
@@ -128,7 +122,15 @@ pub async fn serve(
         .get_namespace_index(NAMESPACE_URI)
         .ok_or_else(|| "namespace não registrado".to_string())?;
 
-    let push_nodes: Vec<(NodeId, Arc<dyn Sensor>)> = {
+    /* Só pra saber QUAIS nomes existem — a estrutura de nodes é construída uma única vez, aqui, a
+    partir da planta que estiver ativa agora. Assume-se que todo reset produz o MESMO conjunto de
+    chaves de sensor/atuador (mesmo binário, mesmo conjunto de `#[sensor(...)]`/`#[actuator(...)]`
+    descobertos por `inventory`) — se isso um dia deixar de valer, a estrutura de nodes precisaria
+    ser reconstruída a cada reset também, não só o valor por trás de cada um.
+    */
+    let initial = runtime.binding();
+
+    let (sensor_nodes, actuator_nodes, clock_id): (Vec<(NodeId, String)>, Vec<(NodeId, String)>, NodeId) = {
         let address_space = node_manager.address_space();
         let mut address_space = address_space.write();
 
@@ -140,25 +142,30 @@ pub async fn serve(
             &NodeId::objects_folder_id(),
         );
 
-        let mut push_nodes: Vec<(NodeId, Arc<dyn Sensor>)> = Vec::new();
-
-        for (name, sensor) in sensors {
-            let node_id = NodeId::new(ns, name.clone());
+        let sensor_nodes: Vec<(NodeId, String)> = initial
+            .sensors
+            .keys()
+            .map(|name| (NodeId::new(ns, name.clone()), name.clone()))
+            .collect();
+        for (node_id, name) in &sensor_nodes {
             let _ = address_space.add_variables(
-                vec![Variable::new(&node_id, name.as_str(), name.as_str(), 0f64)],
+                vec![Variable::new(node_id, name.as_str(), name.as_str(), 0f64)],
                 &folder_id,
             );
-            push_nodes.push((node_id, sensor));
         }
 
-        /* Um único node por atuador, read-write — a mesma NodeId entra na lista de push (lida via
-        o Sensor espelho) E ganha o write callback (comando entrando). Não são dois nodes: seria
-        ambíguo pro cliente OPC-UA (qual dos dois é "a válvula X"?) e a UI nem deixaria escrever
-        no que parece ser um node read-only.
+        /* Um único node por atuador, read-write — a mesma NodeId é lida via o Sensor espelho E
+        ganha o write callback (comando entrando). Não são dois nodes: seria ambíguo pro cliente
+        OPC-UA (qual dos dois é "a válvula X"?) e a UI nem deixaria escrever no que parece ser um
+        node read-only.
         */
-        for (name, shadow_sensor) in actuators {
-            let node_id = NodeId::new(ns, name.clone());
-            let mut var = Variable::new(&node_id, name.as_str(), name.as_str(), 0f64);
+        let actuator_nodes: Vec<(NodeId, String)> = initial
+            .actuators
+            .keys()
+            .map(|name| (NodeId::new(ns, name.clone()), name.clone()))
+            .collect();
+        for (node_id, name) in &actuator_nodes {
+            let mut var = Variable::new(node_id, name.as_str(), name.as_str(), 0f64);
             /* `set_writable()` só mexe em `access_level` (capacidade do SERVIDOR) — o serviço de
             Write valida contra `user_access_level` (capacidade do USUÁRIO autenticado), que
             `Variable::new()` inicializa só com `CURRENT_READ`. Sem isso, todo Write cai em
@@ -168,7 +175,8 @@ pub async fn serve(
             var.set_user_access_level(AccessLevel::CURRENT_READ | AccessLevel::CURRENT_WRITE);
             let _ = address_space.add_variables(vec![var], &folder_id);
 
-            let commands = commands.clone();
+            let runtime_for_write = runtime.clone();
+            let name_for_write = name.clone();
             node_manager.inner().add_write_callback(
                 node_id.clone(),
                 move |data_value: DataValue, _range: &NumericRange| match data_value
@@ -177,14 +185,18 @@ pub async fn serve(
                     .and_then(|v| v.as_f64())
                 {
                     Some(value) => {
-                        let _ = commands.send((name.clone(), value));
+                        /* Fresco a cada Write — o `Sender` de uma planta antiga (pré-reset) não
+                        tem mais ninguém do outro lado pra receber; capturar um `Sender` fixo aqui
+                        faria toda escrita depois de um reset se perder silenciosamente. */
+                        let _ = runtime_for_write
+                            .binding()
+                            .commands
+                            .send((name_for_write.clone(), value));
                         StatusCode::Good
                     }
                     None => StatusCode::BadTypeMismatch,
                 },
             );
-
-            push_nodes.push((node_id, shadow_sensor));
         }
 
         /* `RuntimeControl` implementa `Sensor` (runtime_control.rs) só pra expor `t_h` — entra na
@@ -195,23 +207,24 @@ pub async fn serve(
             vec![Variable::new(&clock_id, "clock.t_h", "clock.t_h", 0f64)],
             &folder_id,
         );
-        push_nodes.push((clock_id, control.clone() as Arc<dyn Sensor>));
 
-        /* Três Method (`Call`, não `Read`/`Write`) — cada callback chama `RuntimeControl`
-        diretamente, sem canal: diferente da escrita de atuador acima, `RuntimeControl` já é
-        `Send + Sync` por inteiro (só atomics por dentro), não uma leitura-espelho de algo `!Send`
-        que precisa ser aplicado de volta na Thread da planta. `reset` fica de fora por enquanto —
-        ver nota em `runtime_control.rs`.
+        /* Cinco Method (`Call`, não `Read`/`Write`). pause/resume/set_speed resolvem `binding()`
+        fresco a cada chamada — sempre agem na planta viva, nunca numa instância descartada por um
+        reset anterior. reset/shutdown chamam direto em `Runtime` (não em `RuntimeControl`: não há
+        uma instância que sobreviva a um reset pra segurar esse estado) — cada um roda a chamada
+        bloqueante do `Runtime` dentro do seu próprio `std::thread::spawn`, pra nunca travar o
+        runtime tokio de thread única deste adaptador (`reset()` espera até 1 tick_interval pela
+        Thread da planta antiga morrer + o tempo de subir uma nova).
         */
         let pause_id = NodeId::new(ns, "control.pause");
         MethodBuilder::new(&pause_id, "control.pause", "control.pause")
             .component_of(folder_id.clone())
             .insert(&mut *address_space);
-        let control_for_pause = control.clone();
+        let runtime_for_pause = runtime.clone();
         node_manager
             .inner()
             .add_method_callback(pause_id, move |_args: &[Variant]| {
-                control_for_pause.pause();
+                runtime_for_pause.binding().control.pause();
                 Ok(Vec::new())
             });
 
@@ -219,11 +232,11 @@ pub async fn serve(
         MethodBuilder::new(&resume_id, "control.resume", "control.resume")
             .component_of(folder_id.clone())
             .insert(&mut *address_space);
-        let control_for_resume = control.clone();
+        let runtime_for_resume = runtime.clone();
         node_manager
             .inner()
             .add_method_callback(resume_id, move |_args: &[Variant]| {
-                control_for_resume.resume();
+                runtime_for_resume.binding().control.resume();
                 Ok(Vec::new())
             });
 
@@ -237,7 +250,7 @@ pub async fn serve(
                 &[("factor", DataTypeId::Double).into()],
             )
             .insert(&mut *address_space);
-        let control_for_speed = control.clone();
+        let runtime_for_speed = runtime.clone();
         node_manager
             .inner()
             .add_method_callback(speed_id, move |args: &[Variant]| {
@@ -245,24 +258,65 @@ pub async fn serve(
                     .first()
                     .and_then(Variant::as_f64)
                     .ok_or(StatusCode::BadInvalidArgument)?;
-                control_for_speed.set_speed(factor);
+                runtime_for_speed.binding().control.set_speed(factor);
                 Ok(Vec::new())
             });
 
-        push_nodes
+        let reset_id = NodeId::new(ns, "control.reset");
+        MethodBuilder::new(&reset_id, "control.reset", "control.reset")
+            .component_of(folder_id.clone())
+            .insert(&mut *address_space);
+        let runtime_for_reset = runtime.clone();
+        node_manager
+            .inner()
+            .add_method_callback(reset_id, move |_args: &[Variant]| {
+                let runtime_for_reset = runtime_for_reset.clone();
+                std::thread::spawn(move || {
+                    if let Err(err) = runtime_for_reset.reset() {
+                        eprintln!("[adapter] control.reset falhou: {err}");
+                    }
+                });
+                Ok(Vec::new())
+            });
+
+        let shutdown_id = NodeId::new(ns, "control.shutdown");
+        MethodBuilder::new(&shutdown_id, "control.shutdown", "control.shutdown")
+            .component_of(folder_id.clone())
+            .insert(&mut *address_space);
+        let runtime_for_shutdown = runtime.clone();
+        node_manager
+            .inner()
+            .add_method_callback(shutdown_id, move |_args: &[Variant]| {
+                let runtime_for_shutdown = runtime_for_shutdown.clone();
+                std::thread::spawn(move || runtime_for_shutdown.request_shutdown());
+                Ok(Vec::new())
+            });
+
+        (sensor_nodes, actuator_nodes, clock_id)
     };
 
     let subscriptions = handle.subscriptions().clone();
 
+    let runtime_for_push = runtime.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         loop {
             interval.tick().await;
 
-            let updates: Vec<_> = push_nodes
-                .iter()
-                .map(|(node_id, sensor)| (node_id, None, DataValue::new_now(sensor.read())))
-                .collect();
+            let binding = runtime_for_push.binding();
+            let mut updates = Vec::with_capacity(sensor_nodes.len() + actuator_nodes.len() + 1);
+
+            for (node_id, name) in &sensor_nodes {
+                if let Some(sensor) = binding.sensors.get(name) {
+                    updates.push((node_id, None, DataValue::new_now(sensor.read())));
+                }
+            }
+            for (node_id, name) in &actuator_nodes {
+                if let Some(shadow) = binding.actuators.get(name) {
+                    updates.push((node_id, None, DataValue::new_now(shadow.read())));
+                }
+            }
+            updates.push((&clock_id, None, DataValue::new_now(binding.control.read())));
 
             let _ = node_manager.set_values(&subscriptions, updates.into_iter());
         }

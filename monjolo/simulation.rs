@@ -16,39 +16,70 @@ concreta dentro de `monjolo` mais (isso agora é responsabilidade de quem monta 
 `tep-plant`). `Simulation` por enquanto só sabe rodar um `DynamicModel` — nenhum mecanismo de
 exposição externa existe ainda.
 
+NOTA (2026-09-09, issue #67): adaptador de rede saiu de vez daqui, de novo — desta vez não "ainda não
+redesenhado", mas por decisão de arquitetura definitiva: `Simulation` não deve saber que um adaptador
+existe. Quem sobe/gerencia um adaptador é `crate::runtime::Runtime`, um objeto persistente que
+sobrevive a várias `Simulation`s ao longo do tempo (cada `reset()` descarta a atual e sobe outra do
+zero) — ver `spec-tennessee-eastman/docs/issue61_runtime_supervisor/nota_runtime_supervisor.md` pro
+desenho completo. `run()` (bloqueante, API antiga) e `spawn()` (não-bloqueante, o que `Runtime` usa)
+coexistem: `run()` agora é só `self.spawn()?.wait()`.
+
 Integrator (RK4): `tick_interval` é só o ritmo de parede (quanto a thread dorme entre rodadas) —
 nunca o passo físico de integração, que teria unidade errada (segundos de parede != horas de
 processo). `dt_hours` é o passo simulado de verdade, decidido à parte.
 
 Supervisor (lifecycle): a Thread da planta manda exatamente um `ServiceEvent` pro canal de lifecycle
-como último passo antes de retornar — seja por retorno normal, erro fatal sem pânico, ou pânico de
-verdade (capturado via `std::panic::catch_unwind`, nunca deixado vazar pra fora da thread). `run()`
-bloqueia em `events_rx.recv()`.
+como último passo antes de retornar — seja por retorno normal (inclusive um `reset()` do `Runtime`,
+que agora é a forma normal de terminar, não só um caso de borda nunca exercitado), erro fatal sem
+pânico, ou pânico de verdade (capturado via `std::panic::catch_unwind`, nunca deixado vazar pra fora
+da thread). `RunningSimulation::wait()` bloqueia em `events_rx.recv()` (`run()` só chama isso).
 */
 
+use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::adapter::AdapterConfig;
 use crate::dynamic_model::{Composite, CompositeDynamicModel, DynamicModel};
 use crate::numerical_method::NumericalMethod;
 use crate::runtime_control::RuntimeControl;
+use crate::sensor::Sensor;
 use crate::snapshot::Snapshot;
 use crate::state_registry::{Proxy, StateRegistry};
 
 type ModelFactory =
     dyn FnOnce(&mut StateRegistry, &Snapshot) -> (Box<dyn DynamicModel>, Vec<String>) + Send;
 
+/** Tudo que um adaptador externo precisa pra expor UMA instância de planta, empacotado como uma
+única unidade — o que `Runtime` (`runtime.rs`) troca atomicamente a cada `reset()`, via
+`RwLock<Arc<PlantBinding>>`, nunca campo por campo (ver "por que trocar tudo de uma vez, num Arc só"
+na nota_runtime_supervisor.md — 4 peças trocadas independentemente deixa uma janela onde um leitor
+pega sensores NOVOS com o `commands` VELHO, cujo receptor já morreu junto da Thread da planta antiga).
+
+Mesmo conteúdo que `spawn_adapter_thread` construía ad-hoc antes de #67 existir — só que agora
+nomeado e reenviado pra fora da Thread da planta via `ready`, em vez de consumido ali mesmo pra subir
+um servidor OPC-UA direto. Não sabe nada de OPC-UA: é o mesmo tipo que serviria qualquer adaptador
+futuro (MQTT, REST, etc.).
+*/
+pub struct PlantBinding {
+    pub sensors: HashMap<String, Arc<dyn Sensor>>,
+    /* "Sensor" espelho de cada atuador — mesma técnica de sempre (Art. 3.6.6/12.1 do CONTRIBUTING):
+    lê de volta a própria posição do atuador, que já é Send+Sync via StateRegistry. */
+    pub actuators: HashMap<String, Arc<dyn Sensor>>,
+    pub commands: Sender<(String, f64)>,
+    pub control: Arc<RuntimeControl>,
+}
+
 /** Evento de fim de vida da Thread da planta — manda exatamente um destes, como último passo antes
-de retornar. `run()` bloqueia em `events_rx.recv()` esperando ele — é assim que percebe a thread
-morta sem precisar de polling.
+de retornar. `RunningSimulation::wait()` bloqueia em `events_rx.recv()` esperando ele — é assim que
+percebe a thread morta sem precisar de polling.
 */
 enum ServiceEvent {
-    /* Terminou sem erro — hoje a plant thread roda um `loop {}` sem break, então isso nunca
-    acontece de verdade, mas o tipo comporta pra quando isso deixar de ser verdade.
+    /* Terminou sem erro — antes de #67 a plant thread rodava um `loop {}` sem break, então isso
+    nunca acontecia de verdade; agora é o caminho NORMAL de término, tomado quando
+    `RuntimeControl::take_reset_request()` devolve `true` (`Runtime::reset()`/`shutdown()`).
     */
     Stopped,
     /* Encerrou por um erro que o próprio serviço detectou e decidiu devolver como `Err` — não um
@@ -73,13 +104,57 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/** Devolvido por `Simulation::spawn()` — a Thread da planta já está rodando (ou pelo menos já foi
+criada; `ready` ainda pode não ter chegado). Quem segura isto decide o QUANDO: pode esperar `ready`
+pra saber que o `StateRegistry` resolveu e os sensores/atuadores-espelho existem, pode chamar
+`control` a qualquer momento (não depende de `ready`, já que `RuntimeControl` é criado ANTES da
+thread subir), e decide se/quando chama `wait()` pra bloquear até ela morrer.
+*/
+pub struct RunningSimulation {
+    pub handle: JoinHandle<()>,
+    pub control: Arc<RuntimeControl>,
+    /** Recebe exatamente UM `PlantBinding`, assim que `StateRegistry::resolve()` (geral +
+    sensores-espelho de atuador) terminar dentro da Thread da planta. Nunca manda um segundo —
+    quem quiser saber sensores/atuadores de novo depois disso já tem o `Arc<dyn Sensor>` (Send+Sync
+    de verdade, lido quantas vezes quiser via `.read()`), não precisa reconsultar este canal.
+    */
+    pub ready: Receiver<PlantBinding>,
+    events: Receiver<ServiceEvent>,
+}
+
+impl RunningSimulation {
+    /** Bloqueia até a Thread da planta encerrar — normalmente (hoje: só depois de um `reset()`/
+    `shutdown()` externo pedir isso via `RuntimeControl`), erro fatal, ou pânico — e junta a thread.
+    Mesmo comportamento terminal que `Simulation::run()` sempre teve (`run()` é literalmente
+    `self.spawn()?.wait()` agora), só exposto separadamente aqui pra quem (ex.: `crate::runtime::
+    Runtime`) precisa fazer outra coisa com o `RunningSimulation` (ler `control`/`ready`) ANTES de
+    bloquear nisto.
+    */
+    pub fn wait(self) -> Result<(), String> {
+        let event = self.events.recv().map_err(|_| {
+            "wait: a plant thread não reportou nada — canal de lifecycle fechado inesperadamente"
+                .to_string()
+        })?;
+
+        /* A thread já mandou seu evento — está a um passo de retornar (foi o último passo antes
+        disso). Juntar ela é rápido e seguro.
+        */
+        let _ = self.handle.join();
+
+        match event {
+            ServiceEvent::Stopped => Ok(()),
+            ServiceEvent::Failed(reason) => Err(format!("plant: encerrou com erro fatal: {reason}")),
+            ServiceEvent::Panicked(reason) => Err(format!("plant: entrou em pânico: {reason}")),
+        }
+    }
+}
+
 pub struct Simulation {
     model_factory: Option<Box<ModelFactory>>,
     config_path: Option<String>,
     tick_interval: Duration,
     dt_hours: f64,
     numerical_method: NumericalMethod,
-    adapter: Option<AdapterConfig>,
     runtime_control: Arc<RuntimeControl>,
 }
 
@@ -91,7 +166,6 @@ impl Default for Simulation {
             tick_interval: Duration::from_millis(500),
             dt_hours: 1.0 / 3600.0,
             numerical_method: NumericalMethod::default(),
-            adapter: None,
             runtime_control: Arc::new(RuntimeControl::new()),
         }
     }
@@ -127,21 +201,13 @@ impl Simulation {
         self.numerical_method = method;
     }
 
-    /** Liga um adaptador de rede (`adapter/mod.rs`) — hoje só `AdapterConfig::OpcUa`, e só existe
-    uma variante construível com a feature `opcua` ligada (sem ela, `AdapterConfig` fica sem nenhum
-    valor possível de passar aqui, mas a chamada continua compilando). Sobe numa thread própria,
-    dentro de `spawn_plant_thread`, só depois do `StateRegistry` já ter resolvido tudo — nunca antes
-    de existir isso pra descobrir.
-    */
-    pub fn set_adapter(&mut self, adapter: AdapterConfig) {
-        self.adapter = Some(adapter);
-    }
-
-    /** Devolve um clone do `Arc<RuntimeControl>` desta `Simulation` — chame ANTES de `run()` (que
-    consome `self` por valor): a mesma instância acompanha a Thread da planta por dentro (lida a
-    cada tick) e pode ser passada pra fora, pra quem monta um adapter (ex.:
-    `AdapterConfig::OpcUa { control: simulation.runtime_control(), .. }`), sem duplicar estado —
-    pausar/mudar velocidade por uma ponta é visível pela outra imediatamente, mesmo `Arc`.
+    /** Devolve um clone do `Arc<RuntimeControl>` desta `Simulation` — chame ANTES de `run()`/
+    `spawn()` (que consomem `self` por valor): a mesma instância acompanha a Thread da planta por
+    dentro (lida a cada tick), e pausar/mudar velocidade por este handle é visível por ela
+    imediatamente, mesmo `Arc`. `spawn()` também devolve o mesmo `Arc` em
+    `RunningSimulation::control` — chamar este método antes é só pra quem precisa dele ANTES de
+    `spawn()` retornar (ex.: `Runtime::new()`, que constrói a `Simulation` e precisa decidir o que
+    fazer com o controle antes mesmo de ela terminar de subir).
     */
     pub fn runtime_control(&self) -> Arc<RuntimeControl> {
         self.runtime_control.clone()
@@ -204,21 +270,23 @@ impl Simulation {
         }));
     }
 
-    /** Chamada terminal — consome a `Simulation` (builder) e sobe a "Thread da planta". Devolve
-    `Err` sem subir thread nenhuma se NEM `set_model()` NEM `set_config_path()` foram chamados —
-    não dá pra saber se isso foi esquecido ou se é mesmo pra rodar vazio; exigir pelo menos um dos
-    dois é o sinal mínimo de "sim, quero rodar algo". Se só `set_model()` foi chamado, `run()` usa
-    `Snapshot` vazio pra config; se só `set_config_path()`, a simulação é inteiramente montada por
-    `inventory` (nenhum modelo construído à mão).
+    /** Chamada terminal não-bloqueante — consome a `Simulation` (builder), sobe a "Thread da
+    planta" e devolve IMEDIATAMENTE um `RunningSimulation` (handle da thread + `RuntimeControl` +
+    o lado de leitura de dois canais: `ready`, que recebe exatamente um `PlantBinding` assim que o
+    `StateRegistry` resolver e os sensores/atuadores-espelho estiverem prontos, e o canal de
+    lifecycle interno que `RunningSimulation::wait()` consome). Quem só quer "rodar e bloquear até
+    acabar", como sempre foi o comportamento de `Simulation`, continua usando `run()` — que agora é
+    só `self.spawn()?.wait()`. Quem precisa de mais controle sobre o QUANDO (ex.: `crate::runtime::
+    Runtime`, que precisa saber quando a planta está pronta pra trocar seu `PlantBinding`, e decidir
+    depois quando/se espera ela morrer) usa `spawn()` direto.
 
-    Bloqueia até a thread encerrar — normalmente, erro fatal ou pânico (capturado, nunca propagado
-    como pânico de verdade). `Ok(())` só no caso raro de encerrar limpo; qualquer erro ou pânico
-    vira `Err` descrevendo por quê.
+    Mesma validação de sempre: `Err` sem subir thread nenhuma se NEM `set_model()` NEM
+    `set_config_path()` foram chamados.
     */
-    pub fn run(mut self) -> Result<(), String> {
+    pub fn spawn(mut self) -> Result<RunningSimulation, String> {
         if self.model_factory.is_none() && self.config_path.is_none() {
             return Err(
-                "run: nada configurado — chame set_model() e/ou set_config_path() antes".to_string(),
+                "spawn: nada configurado — chame set_model() e/ou set_config_path() antes".to_string(),
             );
         }
 
@@ -235,7 +303,7 @@ impl Simulation {
         });
 
         eprintln!(
-            "[main] Simulation::run — método numérico: {:?}",
+            "[main] Simulation::spawn — método numérico: {:?}",
             self.numerical_method,
         );
 
@@ -243,10 +311,10 @@ impl Simulation {
         let dt_hours = self.dt_hours;
         let numerical_method = self.numerical_method;
         let config_path = self.config_path.take();
-        let adapter = self.adapter.take();
         let runtime_control = self.runtime_control.clone();
 
         let (events_tx, events_rx) = std::sync::mpsc::channel::<ServiceEvent>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<PlantBinding>();
 
         let handle = Self::spawn_plant_thread(
             model_factory,
@@ -254,26 +322,28 @@ impl Simulation {
             tick_interval,
             dt_hours,
             numerical_method,
-            adapter,
-            runtime_control,
+            runtime_control.clone(),
+            ready_tx,
             events_tx,
         );
 
-        let event = events_rx.recv().map_err(|_| {
-            "run: a plant thread não reportou nada — canal de lifecycle fechado inesperadamente"
-                .to_string()
-        })?;
+        Ok(RunningSimulation {
+            handle,
+            control: runtime_control,
+            ready: ready_rx,
+            events: events_rx,
+        })
+    }
 
-        /* A thread já mandou seu evento — está a um passo de retornar (foi o último passo antes
-        disso). Juntar ela é rápido e seguro.
-        */
-        let _ = handle.join();
-
-        match event {
-            ServiceEvent::Stopped => Ok(()),
-            ServiceEvent::Failed(reason) => Err(format!("plant: encerrou com erro fatal: {reason}")),
-            ServiceEvent::Panicked(reason) => Err(format!("plant: entrou em pânico: {reason}")),
-        }
+    /** Chamada terminal bloqueante — `self.spawn()?.wait()`. Mantido pelo comportamento histórico
+    de `Simulation` (e por todo teste que já assumia isso, ver módulo `tests` embaixo): sobe a
+    Thread da planta e só retorna quando ela encerra, erro fatal ou pânico (capturado, nunca
+    propagado como pânico de verdade) virando `Err`; encerramento limpo (hoje: só via
+    `crate::runtime::Runtime::reset()`/`shutdown()` pedindo à `Thread da planta pra parar) vira
+    `Ok(())`.
+    */
+    pub fn run(self) -> Result<(), String> {
+        self.spawn()?.wait()
     }
 
     /** Sobe a "Thread da planta": cria `StateRegistry`, carrega o `Snapshot` de config (se
@@ -291,8 +361,8 @@ impl Simulation {
         tick_interval: Duration,
         dt_hours: f64,
         numerical_method: NumericalMethod,
-        adapter: Option<AdapterConfig>,
         runtime_control: Arc<RuntimeControl>,
+        ready: Sender<PlantBinding>,
         events: Sender<ServiceEvent>,
     ) -> JoinHandle<()> {
         std::thread::Builder::new()
@@ -331,19 +401,61 @@ impl Simulation {
                         .resolve()
                         .expect("plant thread: falha ao resolver o StateRegistry — algum `need` não tem provedor");
 
-                    /* Sobe a thread do adaptador (hoje só OPC-UA) só depois do resolve() acima —
-                    StateRegistry/sensor_catalog/actuator_catalog só estão completos e estáveis a
-                    partir daqui. `Rc`/`Proxy`/`StateRegistry` nunca saem desta thread: só o que
-                    atravessa é `Arc<dyn Sensor>` (já Send+Sync de verdade) e os NOMES dos atuadores
-                    — a escrita em si volta por `command_rx`, drenado a cada tick do loop abaixo,
-                    nunca dentro da thread do adaptador (ver `monjolo::adapter::opcua`).
+                    /* Monta o PlantBinding e manda pra fora via `ready` só depois do resolve()
+                    acima — StateRegistry/sensor_catalog/actuator_catalog só estão completos e
+                    estáveis a partir daqui. `Rc`/`Proxy`/`StateRegistry` nunca saem desta thread: só
+                    o que atravessa é `Arc<dyn Sensor>` (já Send+Sync de verdade) dentro do
+                    `PlantBinding` — a escrita em si volta por `command_rx`, drenado a cada tick do
+                    loop abaixo, nunca por quem recebe o `PlantBinding` (ver `crate::runtime::
+                    Runtime`, `monjolo::adapter::opcua`). Construído incondicionalmente (não só sob a
+                    feature `opcua`): o custo é uma dúzia de `HashMap`/`Arc::clone`, e não amarra mais
+                    este arquivo a saber se ALGUÉM vai ler `ready` — quem não lê (ex.: os testes deste
+                    módulo, que só usam `run()`) simplesmente deixa o `Sender` cair no chão.
+
+                    `actuators`: cada atuador ganha um `Sensor` "espelho" só-leitura na MESMA chave
+                    (`Sensor` nunca inventa valor próprio, só lê de volta um `#[state]`/`#[offer]`
+                    que já existe — a própria posição do atuador) — sem isso, não haveria como
+                    publicar a posição de volta pro cliente externo: só existiria o write callback
+                    (comando entrando), o valor ficaria travado no `0.0` inicial pra sempre, nunca
+                    refletindo o estado de verdade.
                     */
-                    let _ = &adapter;
-                    #[cfg(feature = "opcua")]
-                    let command_rx: Option<std::sync::mpsc::Receiver<(String, f64)>> =
-                        Self::spawn_adapter_thread(adapter, &registry);
-                    #[cfg(not(feature = "opcua"))]
-                    let command_rx: Option<std::sync::mpsc::Receiver<(String, f64)>> = None;
+                    let sensors: HashMap<String, Arc<dyn Sensor>> = registry
+                        .borrow()
+                        .sensor_names()
+                        .map(|name| {
+                            let sensor = registry
+                                .borrow()
+                                .sensor(name)
+                                .expect("sensor_names() e sensor() devem concordar sobre o catálogo");
+                            (name.to_string(), sensor)
+                        })
+                        .collect();
+
+                    let actuator_names: Vec<String> =
+                        registry.borrow().actuator_names().map(String::from).collect();
+                    let actuators: HashMap<String, Arc<dyn Sensor>> = actuator_names
+                        .iter()
+                        .map(|name| {
+                            let shadow = crate::sensor::model::Sensor::new(
+                                &mut registry.borrow_mut(),
+                                name,
+                                Box::new(crate::sensor::model::Ideal),
+                            );
+                            (name.clone(), shadow as Arc<dyn Sensor>)
+                        })
+                        .collect();
+                    registry
+                        .borrow_mut()
+                        .resolve()
+                        .expect("plant thread: falha ao resolver os sensores-espelho dos atuadores");
+
+                    let (command_tx, command_rx) = std::sync::mpsc::channel::<(String, f64)>();
+                    let _ = ready.send(PlantBinding {
+                        sensors,
+                        actuators,
+                        commands: command_tx,
+                        control: runtime_control.clone(),
+                    });
 
                     let mut state_proxies: Vec<Proxy> = Vec::with_capacity(model_state_keys.len());
                     let mut derivative_proxies: Vec<Proxy> = Vec::with_capacity(model_state_keys.len());
@@ -359,25 +471,38 @@ impl Simulation {
                     );
 
                     loop {
-                        /* Drena os comandos de escrita que chegaram pela thread do adaptador desde
-                        o último tick (ver comentário acima do `spawn_adapter_thread`) — ponto
-                        único e determinístico de aplicação, sempre antes da física deste tick.
-                        `Rc<dyn Actuator>` nunca sai desta thread: só o nome/valor atravessou.
+                        /* Drena os comandos de escrita que chegaram de fora desde o último tick —
+                        ponto único e determinístico de aplicação, sempre antes da física deste
+                        tick. `Rc<dyn Actuator>` nunca sai desta thread: só o nome/valor atravessou.
                         Drenado mesmo pausado — um comando escrito durante a pausa já fica aplicado
-                        pra quando a simulação retomar, em vez de se perder.
+                        pra quando a simulação retomar, em vez de se perder. Sempre um `Receiver`
+                        de verdade agora (não mais `Option`): não custa nada drenar um canal do qual
+                        ninguém nunca escreveu, `try_recv()` só devolve `Empty` na hora.
                         */
-                        if let Some(rx) = &command_rx {
-                            while let Ok((name, value)) = rx.try_recv() {
-                                match registry.borrow().actuator(&name) {
-                                    Some(actuator) => {
-                                        actuator.write(value);
-                                        eprintln!("[adapter] escrita aplicada: {name} = {value}");
-                                    }
-                                    None => eprintln!(
-                                        "[adapter] escrita ignorada — atuador \"{name}\" não catalogado"
-                                    ),
+                        while let Ok((name, value)) = command_rx.try_recv() {
+                            match registry.borrow().actuator(&name) {
+                                Some(actuator) => {
+                                    actuator.write(value);
+                                    eprintln!("[adapter] escrita aplicada: {name} = {value}");
                                 }
+                                None => eprintln!(
+                                    "[adapter] escrita ignorada — atuador \"{name}\" não catalogado"
+                                ),
                             }
+                        }
+
+                        /* Pedido de reset (`Runtime::reset()`/`shutdown()`, via
+                        `RuntimeControl::request_reset()`) encerra o loop de vez — a thread retorna
+                        normalmente, `ServiceEvent::Stopped` é mandado, e quem construiu esta
+                        `Simulation` (hoje: `crate::runtime::Runtime`) já está esperando nisso pra
+                        saber que pode descartar `model`/`registry`/tudo aqui dentro (todos morrem
+                        com a thread) e subir uma planta nova. Checado ANTES do `is_paused()` de
+                        propósito: pedir reset enquanto pausado não pode ficar preso esperando um
+                        `resume()` que talvez nunca venha.
+                        */
+                        if runtime_control.take_reset_request() {
+                            eprintln!("[plant] reset solicitado — encerrando esta instância");
+                            break;
                         }
 
                         /* Fator de velocidade escala só o ritmo de PAREDE (`tick_interval`) — nunca
@@ -451,97 +576,6 @@ impl Simulation {
             .expect("run: falha ao criar a thread da planta")
     }
 
-    /** Sobe a thread do adaptador de rede, se `adapter` foi configurado — hoje só
-    `AdapterConfig::OpcUa`. Roda num runtime tokio `current_thread` próprio (sem pool de worker
-    threads — não há trabalho paralelo real a justificar um, ver `adapter/opcua.rs`).
-
-    Só `Arc<dyn Sensor>` (catalogado, já Send+Sync de verdade) atravessa pra essa thread — nenhum
-    `Rc`/`Proxy`/`StateRegistry` sai daqui. Devolve o lado de leitura de um canal `(nome, valor)`:
-    escrita de atuador nunca acontece nesta thread, só é anunciada por ela — quem aplica de
-    verdade é `spawn_plant_thread`, drenando esse canal a cada tick.
-
-    `actuators`: cada atuador ganha um `Sensor` "espelho" só-leitura na MESMA chave (`Sensor` nunca
-    inventa valor próprio, só lê de volta um `#[state]`/`#[offer]` que já existe — a própria posição
-    do atuador, exatamente como `ReactorPressure` lê `reactor.temperature`) — sem isso, `serve()`
-    não tinha como publicar a posição de volta pro cliente OPC-UA: só existia o write callback
-    (comando entrando), o node ficava travado no `0.0` inicial pra sempre, nunca refletindo o
-    estado de verdade. Construído (e resolvido de novo) AQUI, depois do resolve() geral em
-    `spawn_plant_thread` — sensores novos precisam de outro `resolve()` antes de `read()` ser
-    seguro (mesmo ciclo declare → resolve de qualquer `Sensor`).
-
-    Erro do servidor OPC-UA (`serve()` retornando `Err`, ex.: porta ocupada) só é logado — não
-    propaga pro `ServiceEvent` do supervisor nesta primeira versão; simplificação deliberada, não um
-    esquecimento (a Thread da planta continua rodando normalmente mesmo se o adaptador cair).
-    */
-    #[cfg(feature = "opcua")]
-    fn spawn_adapter_thread(
-        adapter: Option<AdapterConfig>,
-        registry: &std::rc::Rc<std::cell::RefCell<StateRegistry>>,
-    ) -> Option<std::sync::mpsc::Receiver<(String, f64)>> {
-        /* `control`: o MESMO `Arc<RuntimeControl>` que `Simulation::runtime_control()` devolveu —
-        quem monta o `AdapterConfig::OpcUa` (ex.: `tep-plant/src/main.rs`) é responsável por passar
-        essa mesma instância, não uma nova (ver comentário em `adapter/mod.rs`); não há como o
-        compilador forçar isso, só documentar o contrato.
-        */
-        let AdapterConfig::OpcUa { endpoint, control } = adapter?;
-
-        let sensors: std::collections::HashMap<String, std::sync::Arc<dyn crate::sensor::Sensor>> =
-            registry
-                .borrow()
-                .sensor_names()
-                .map(|name| {
-                    let sensor = registry
-                        .borrow()
-                        .sensor(name)
-                        .expect("sensor_names() e sensor() devem concordar sobre o catálogo");
-                    (name.to_string(), sensor)
-                })
-                .collect();
-
-        let actuator_names: Vec<String> =
-            registry.borrow().actuator_names().map(String::from).collect();
-        let actuators: std::collections::HashMap<String, std::sync::Arc<dyn crate::sensor::Sensor>> =
-            actuator_names
-                .iter()
-                .map(|name| {
-                    let shadow = crate::sensor::model::Sensor::new(
-                        &mut registry.borrow_mut(),
-                        name,
-                        Box::new(crate::sensor::model::Ideal),
-                    );
-                    (name.clone(), shadow as std::sync::Arc<dyn crate::sensor::Sensor>)
-                })
-                .collect();
-        registry
-            .borrow_mut()
-            .resolve()
-            .expect("adapter thread: falha ao resolver os sensores-espelho dos atuadores");
-
-        let (command_tx, command_rx) = std::sync::mpsc::channel::<(String, f64)>();
-
-        std::thread::Builder::new()
-            .name("adapter".to_string())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("adapter thread: falha ao criar runtime tokio");
-
-                let outcome = runtime.block_on(crate::adapter::opcua::serve(
-                    sensors,
-                    actuators,
-                    command_tx,
-                    control,
-                    &endpoint,
-                ));
-                if let Err(err) = outcome {
-                    eprintln!("[adapter] servidor OPC-UA encerrou com erro: {err}");
-                }
-            })
-            .expect("run: falha ao criar a thread do adapter");
-
-        Some(command_rx)
-    }
 }
 
 #[cfg(test)]
