@@ -14,7 +14,83 @@ reconstruído do zero a cada reset, nunca remendado no lugar.
 
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
+use crate::numerical_method::NumericalMethod;
 use crate::simulation::{PlantBinding, RunningSimulation, Simulation};
+
+/** Convenção fixa (issue #68) — `application.toml` sempre na raiz do projeto (diretório de trabalho
+no momento em que o binário roda), nunca um caminho passado por quem monta a aplicação. Mesmo papel
+de `application.properties`/`.yml` na raiz do classpath no Spring: a APLICAÇÃO não escolhe onde
+procurar, só o CONTEÚDO é dela.
+*/
+const CONFIG_PATH: &str = "application.toml";
+
+/* Porta IANA padrão de OPC-UA. Host é `127.0.0.1`, não `0.0.0.0` — de propósito: async-opcua-server
+não distingue "endereço de bind" de "endereço anunciado" (`ServerInfo::base_endpoint()`, em
+async-opcua-server/src/info.rs, monta o EndpointUrl que o servidor devolve em GetEndpoints/
+FindServers a partir do MESMO `tcp_config.host` do bind). Com `0.0.0.0`, o servidor aceita conexão em
+qualquer interface, mas anuncia a si mesmo como "opc.tcp://0.0.0.0:...", um endereço que nenhum
+cliente consegue discar de verdade — quebra qualquer client que confie no EndpointUrl reportado pra
+reconectar (ex.: UaExpert), mesmo que a conexão inicial/manual funcione. Se um dia isso precisar ser
+alcançável de outra máquina na rede, precisa virar configurável (bind em 0.0.0.0, anunciar o IP real
+da máquina) — não dá pra ter os dois com essa constante sozinha hoje.
+*/
+#[cfg(feature = "opcua")]
+const DEFAULT_OPCUA_ENDPOINT: &str = "opc.tcp://127.0.0.1:4840/tep/server/";
+
+/** Configurações de framework lidas de `[monjolo]` dentro de `application.toml` — deliberadamente
+separado de `Snapshot` (`snapshot.rs`), que só entende `f64` e ignora todo o resto. Mesmo arquivo,
+duas leituras independentes: `Snapshot` cuida da condição inicial física (`[state.*]`), isto aqui
+cuida de configuração de orquestração (`[monjolo]`) — a mesma separação que `[meta]` já demonstra
+(tabela não-numérica que `Snapshot` sempre ignorou, sem problema nenhum).
+*/
+#[derive(Debug)]
+struct BootstrapSettings {
+    numerical_method: NumericalMethod,
+    #[cfg(feature = "opcua")]
+    opcua_endpoint: String,
+}
+
+impl BootstrapSettings {
+    /** Arquivo ausente não é erro fatal aqui — cai pros defaults de framework, mesmo espírito de
+    `application.properties` ser opcional no Spring (a app roda com default se ele não existir).
+    Arquivo PRESENTE mas malformado, ou com uma chave reconhecida mas de valor inválido (ex.:
+    `numerical_method = "euler"`, que não existe), É erro fatal — a diferença entre "não configurado"
+    e "configurado errado" importa.
+    */
+    fn load(path: &str) -> Result<Self, String> {
+        let root: Option<toml::Value> = match std::fs::read_to_string(path) {
+            Ok(content) => Some(
+                toml::from_str(&content)
+                    .map_err(|e| format!("bootstrap: erro parseando TOML '{path}': {e}"))?,
+            ),
+            Err(_) => None,
+        };
+
+        let monjolo_table = root.as_ref().and_then(|r| r.get("monjolo"));
+
+        let numerical_method = match monjolo_table
+            .and_then(|m| m.get("numerical_method"))
+            .and_then(|v| v.as_str())
+        {
+            Some(raw) => raw.parse().map_err(|e| format!("bootstrap: {e}"))?,
+            None => NumericalMethod::default(),
+        };
+
+        #[cfg(feature = "opcua")]
+        let opcua_endpoint = monjolo_table
+            .and_then(|m| m.get("opcua"))
+            .and_then(|o| o.get("endpoint"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_OPCUA_ENDPOINT)
+            .to_string();
+
+        Ok(Self {
+            numerical_method,
+            #[cfg(feature = "opcua")]
+            opcua_endpoint,
+        })
+    }
+}
 
 /** Fábrica de uma `Simulation` nova — chamada uma vez no boot do `Runtime` e de novo a cada
 `reset()`. Precisa ser `Fn`, não `FnOnce`: cada chamada tem que produzir uma `Simulation` igualmente
@@ -151,6 +227,49 @@ impl Runtime {
             done = condvar.wait(done).expect("Runtime: Mutex<bool> de shutdown envenenado");
         }
     }
+
+    /** Bootstrap por convenção (issue #68) — mesmo papel de `SpringApplication.run()`: localiza e
+    carrega `application.toml` sozinho (`CONFIG_PATH`, sempre a raiz do projeto, nunca um caminho
+    que a aplicação escolhe), lê `[monjolo].numerical_method` de dentro dele (default `RK4` se
+    ausente), monta a `Simulation` com isso, e — se a feature `opcua` estiver ligada — já sobe o
+    adaptador OPC-UA no endpoint de `[monjolo.opcua].endpoint` (default o IANA padrão se ausente).
+    Quem chama isto não passa NENHUMA dessas três coisas — não é código imperativo escolhendo
+    estratégia/caminho/endpoint, é dado, lido de um arquivo por convenção.
+
+    `main()` de uma aplicação real fica só: `Runtime::bootstrap().expect(...).run();`
+    */
+    pub fn bootstrap() -> Result<Arc<Self>, String> {
+        let settings = BootstrapSettings::load(CONFIG_PATH)?;
+        let numerical_method = settings.numerical_method;
+
+        let runtime = Runtime::new(move || {
+            let mut simulation = Simulation::new();
+            simulation.set_config_path(CONFIG_PATH);
+            simulation.set_numerical_method(numerical_method);
+            simulation
+        })?;
+
+        #[cfg(feature = "opcua")]
+        runtime.spawn_opcua_adapter(settings.opcua_endpoint);
+
+        Ok(runtime)
+    }
+
+    /** Bloqueia pelo resto da vida do processo, do jeito certo pra cada configuração de feature —
+    quem chama (`main()`) nunca precisa de `#[cfg(feature = "opcua")]` pra saber a diferença. Com a
+    feature ligada, espera de verdade `control.shutdown` (`wait_for_shutdown()`). Sem ela, não há
+    nenhum jeito de pedir shutdown de fora — a planta continua rodando normalmente no fundo, então
+    isto só estaciona a thread principal (`park()` em loop) pra sempre, em vez de bloquear numa
+    `Condvar` que ninguém nunca vai notificar.
+    */
+    pub fn run(&self) {
+        #[cfg(feature = "opcua")]
+        self.wait_for_shutdown();
+        #[cfg(not(feature = "opcua"))]
+        loop {
+            std::thread::park();
+        }
+    }
 }
 
 /** Sobe o adaptador OPC-UA numa thread própria, pelo tempo de vida inteiro do `Runtime` — spawnado
@@ -187,6 +306,101 @@ mod tests {
     use crate::sensor::model::{Ideal, Sensor as ConcreteSensor};
     use crate::state_registry::{Proxy, StateRegistry};
     use std::time::Duration;
+
+    /* Escreve `content` num arquivo temporário com nome único (evita colisão entre testes
+    rodando em paralelo, já que `cargo test` não serializa por padrão), roda `body` com o
+    caminho, e sempre limpa o arquivo depois — mesmo se `body` panicar (`Drop`, não um
+    `finally` manual).
+    */
+    struct TempTomlFile {
+        path: std::path::PathBuf,
+    }
+
+    impl TempTomlFile {
+        fn new(name: &str, content: &str) -> Self {
+            let path = std::env::temp_dir().join(name);
+            std::fs::write(&path, content).expect("falha ao escrever TOML temporário de teste");
+            Self { path }
+        }
+
+        fn path_str(&self) -> &str {
+            self.path.to_str().expect("caminho temporário deveria ser UTF-8 válido")
+        }
+    }
+
+    impl Drop for TempTomlFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn bootstrap_settings_default_when_file_is_absent() {
+        let path = std::env::temp_dir().join("monjolo_bootstrap_test_does_not_exist.toml");
+        let _ = std::fs::remove_file(&path); // garante que não existe de uma rodada anterior
+        let settings = BootstrapSettings::load(path.to_str().unwrap())
+            .expect("arquivo ausente não deveria ser erro fatal");
+        assert!(matches!(settings.numerical_method, NumericalMethod::RK4));
+    }
+
+    #[test]
+    fn bootstrap_settings_reads_numerical_method_from_monjolo_table() {
+        let file = TempTomlFile::new(
+            "monjolo_bootstrap_test_numerical_method.toml",
+            "[monjolo]\nnumerical_method = \"RK4\"\n",
+        );
+        let settings =
+            BootstrapSettings::load(file.path_str()).expect("TOML válido não deveria falhar");
+        assert!(matches!(settings.numerical_method, NumericalMethod::RK4));
+    }
+
+    #[test]
+    fn bootstrap_settings_errors_on_unknown_numerical_method() {
+        let file = TempTomlFile::new(
+            "monjolo_bootstrap_test_bad_numerical_method.toml",
+            "[monjolo]\nnumerical_method = \"euler\"\n",
+        );
+        let err = BootstrapSettings::load(file.path_str())
+            .expect_err("método numérico desconhecido deveria ser erro fatal, não um default silencioso");
+        assert!(err.contains("euler"), "mensagem de erro deveria citar o valor inválido: {err}");
+    }
+
+    #[test]
+    fn bootstrap_settings_ignores_unrelated_tables_like_state_and_meta() {
+        /* Mesmo arquivo real que `Simulation`/`Snapshot` consomem pras chaves físicas
+        (`[state.*]`) e `[meta]` — prova que ler `[monjolo]` não colide com, nem exige nada de,
+        o resto do arquivo que `application.toml` de verdade sempre teve.
+        */
+        let file = TempTomlFile::new(
+            "monjolo_bootstrap_test_mixed_file.toml",
+            "[meta]\ndescription = \"não é numérico, Snapshot ignora\"\n\n\
+             [state.reactor]\nenergy = 3.25\n\n\
+             [monjolo]\nnumerical_method = \"rk4\"\n",
+        );
+        let settings = BootstrapSettings::load(file.path_str())
+            .expect("tabelas [meta]/[state.*] não deveriam atrapalhar a leitura de [monjolo]");
+        assert!(matches!(settings.numerical_method, NumericalMethod::RK4));
+    }
+
+    #[cfg(feature = "opcua")]
+    #[test]
+    fn bootstrap_settings_reads_opcua_endpoint_override_and_falls_back_to_default() {
+        let overridden = TempTomlFile::new(
+            "monjolo_bootstrap_test_opcua_endpoint.toml",
+            "[monjolo.opcua]\nendpoint = \"opc.tcp://0.0.0.0:9999/custom/\"\n",
+        );
+        let settings = BootstrapSettings::load(overridden.path_str())
+            .expect("TOML válido não deveria falhar");
+        assert_eq!(settings.opcua_endpoint, "opc.tcp://0.0.0.0:9999/custom/");
+
+        let absent_table = TempTomlFile::new(
+            "monjolo_bootstrap_test_opcua_endpoint_default.toml",
+            "[monjolo]\nnumerical_method = \"rk4\"\n",
+        );
+        let settings = BootstrapSettings::load(absent_table.path_str())
+            .expect("TOML válido não deveria falhar");
+        assert_eq!(settings.opcua_endpoint, DEFAULT_OPCUA_ENDPOINT);
+    }
 
     /* Semeia "test.frozen.value" em 42.0 e nunca mais toca nele — sem `state_keys()` (fica no
     default vazio de `DynamicModel`), então RK4 nunca integra essa chave e nada nunca chama
