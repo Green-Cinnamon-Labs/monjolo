@@ -82,10 +82,6 @@ enum ServiceEvent {
     `RuntimeControl::take_reset_request()` devolve `true` (`Runtime::reset()`/`shutdown()`).
     */
     Stopped,
-    /* Encerrou por um erro que o próprio serviço detectou e decidiu devolver como `Err` — não um
-    pânico de linguagem.
-    */
-    Failed(String),
     /* Entrou em pânico — capturado por `catch_unwind`, nunca deixado vazar pra fora da thread. */
     Panicked(String),
 }
@@ -143,7 +139,6 @@ impl RunningSimulation {
 
         match event {
             ServiceEvent::Stopped => Ok(()),
-            ServiceEvent::Failed(reason) => Err(format!("plant: encerrou com erro fatal: {reason}")),
             ServiceEvent::Panicked(reason) => Err(format!("plant: entrou em pânico: {reason}")),
         }
     }
