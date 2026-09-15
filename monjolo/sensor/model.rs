@@ -174,6 +174,26 @@ mod tests {
     }
 
     #[test]
+    fn read_before_any_commit_ever_happened() {
+        let registry = StateRegistry::shared();
+        let (offered, _) = registry.borrow_mut().subscribe(&["reactor.temperature"], &[]);
+        offered[0].set(120.5);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sensor = Sensor::new(
+            &mut registry.borrow_mut(),
+            "reactor.temperature",
+            Box::new(CountingBehavior { calls: calls.clone() }),
+        );
+
+        registry.borrow_mut().resolve().unwrap();
+        // deliberadamente SEM commit() aqui — investigação spec-tennessee-eastman, controladores
+        println!("about to read with zero commits ever having happened");
+        let value = sensor.read();
+        println!("read() returned {value} without panicking");
+    }
+
+    #[test]
     fn read_is_idempotent_within_the_same_generation() {
         let registry = StateRegistry::shared();
         let (offered, _) = registry.borrow_mut().subscribe(&["reactor.temperature"], &[]);

@@ -460,6 +460,32 @@ impl Simulation {
                     }
                     let integrator = numerical_method.integrator();
 
+                    /* Prime CurrentState ANTES do primeiro tick — sem isso, `Sensor::read()` (usado
+                    por `Controller`/`#[sensor(...)]`, e por qualquer leitor externo via
+                    `ReadProxy`) devolve `0.0` silenciosamente na primeiríssima chamada, porque
+                    `commit()` (que copia EvaluationState -> CurrentState) só roda, normalmente, uma
+                    vez por tick, DEPOIS da integração — e `Controller` é avaliado em TODA chamada de
+                    `evaluate()`, inclusive a primeiríssima do processo inteiro. Sem esta seção, um
+                    controlador P típico (`clamp(bias + kp*(0 - setpoint), 0, 100)`) satura no piso
+                    logo de cara pra qualquer setpoint positivo — no TEP isso significa as 3 válvulas
+                    controladas (pressão/nível) comandadas pra 0% já no tick 0, deslocando a posição
+                    REAL da válvula (que É integrada por RK4) na direção errada antes de o controle
+                    ter qualquer chance de ler um valor de verdade.
+
+                    Dois `evaluate()` com um `commit()` entre eles, não só um: o PRIMEIRO evaluate()
+                    já teria o mesmo problema (CurrentState ainda vazio quando os Controllers dele
+                    rodam) — mas o commit() logo depois popula CurrentState com os valores físicos
+                    reais (semeados via `#[config(...)]`), então o SEGUNDO evaluate() já roda com
+                    Controllers lendo de verdade, deixando `Actuator::command` correto ANTES do
+                    primeiro tick de verdade (e do primeiro sub-passo k1 do RK4) sequer começar.
+                    Nenhum `#[state]` muda de valor aqui — `evaluate()` sozinho nunca escreve estado
+                    via `Proxy::set()`, só recalcula grandezas derivadas — então repetir isto duas
+                    vezes é seguro, não "avança" a simulação nenhuma vez.
+                    */
+                    model.evaluate();
+                    registry.borrow_mut().commit();
+                    model.evaluate();
+
                     eprintln!(
                         "[plant] iniciando — {} chave(s) de estado integrável, tick a cada {tick_interval:?} (dt = {dt_hours}h)",
                         state_proxies.len(),
