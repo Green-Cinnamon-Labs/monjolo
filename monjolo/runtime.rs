@@ -24,6 +24,12 @@ procurar, só o CONTEÚDO é dela.
 */
 const CONFIG_PATH: &str = "application.toml";
 
+/** Onde `bootstrap()` escreve o artefato de diagnóstico de `describe_phase_a_execution_order()`
+(issue spec-tennessee-eastman#71) — mesma convenção de `CONFIG_PATH`: raiz do projeto, sempre esse
+nome, nunca configurável (não é um artefato que a aplicação personaliza, é sempre o mesmo debug).
+*/
+const EXECUTION_ORDER_PATH: &str = "execution_order.txt";
+
 /* Porta IANA padrão de OPC-UA. Host é `127.0.0.1`, não `0.0.0.0` — de propósito: async-opcua-server
 não distingue "endereço de bind" de "endereço anunciado" (`ServerInfo::base_endpoint()`, em
 async-opcua-server/src/info.rs, monta o EndpointUrl que o servidor devolve em GetEndpoints/
@@ -236,9 +242,20 @@ impl Runtime {
     Quem chama isto não passa NENHUMA dessas três coisas — não é código imperativo escolhendo
     estratégia/caminho/endpoint, é dado, lido de um arquivo por convenção.
 
+    Também escreve `EXECUTION_ORDER_PATH` (issue spec-tennessee-eastman#71) — a ordem de execução
+    real da fase (A), recalculada a cada `bootstrap()`, ou seja, a cada vez que o binário é
+    recompilado E rodado de novo (`inventory::submit!` é decidido em tempo de compilação, mas a
+    lista só existe montada em memória a partir do primeiro `inventory::iter()` deste processo).
+    Não bloqueia o boot se a escrita falhar — é um artefato de diagnóstico, não uma dependência
+    funcional da aplicação.
+
     `main()` de uma aplicação real fica só: `Runtime::bootstrap().expect(...).run();`
     */
     pub fn bootstrap() -> Result<Arc<Self>, String> {
+        if let Err(err) = std::fs::write(EXECUTION_ORDER_PATH, crate::component::describe_phase_a_execution_order()) {
+            eprintln!("[bootstrap] não consegui escrever {EXECUTION_ORDER_PATH}: {err}");
+        }
+
         let settings = BootstrapSettings::load(CONFIG_PATH)?;
         let numerical_method = settings.numerical_method;
 

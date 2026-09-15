@@ -152,6 +152,37 @@ pub fn attach_discovered_components(root: &mut Composite, registry: &mut StateRe
     }
 }
 
+/** Ordem de execução REAL da fase (A) — física (`ComponentKind::Dynamic`), onde mora o acoplamento
+entre unidades que este artefato existe pra inspecionar (issue spec-tennessee-eastman#71). Mesma
+lógica que `attach_discovered_components` já roda por dentro, só que sem construir nada — não
+precisa de `StateRegistry`/`Snapshot`/planta nenhuma, porque `name`/`after`/`needs`/`offers` são
+todos `&'static`: já existem completos assim que o binário termina de linkar (é isso que
+`inventory::submit!`, escondido dentro de `#[dynamic_model]`/`#[monjolo::tasks]`, garante em tempo
+de compilação). Por isso dá pra chamar isto de QUALQUER lugar — um teste, um binário de debug, o
+próprio `Runtime::bootstrap()` — sem nenhum outro pré-requisito.
+*/
+pub fn phase_a_execution_order() -> Vec<&'static ComponentDescriptor> {
+    let phase_a: Vec<&'static ComponentDescriptor> = inventory::iter::<ComponentDescriptor>()
+        .filter(|descriptor| descriptor.kind == ComponentKind::Dynamic)
+        .collect();
+    sort_phase_a(phase_a)
+}
+
+/** Formata `phase_a_execution_order()` como texto simples, uma tarefa por linha numerada, com seus
+`needs`/`offers` — o artefato em si. Pensado pra ser lido por humano (auditoria manual: toda chave
+listada em `needs` tem que ter sido oferecida por alguém ACIMA na lista) ou diffado entre builds.
+*/
+pub fn describe_phase_a_execution_order() -> String {
+    let mut description = String::new();
+    for (position, descriptor) in phase_a_execution_order().iter().enumerate() {
+        description.push_str(&format!(
+            "{position:3}. {}\n     needs:  {:?}\n     offers: {:?}\n",
+            descriptor.name, descriptor.needs, descriptor.offers,
+        ));
+    }
+    description
+}
+
 /** Sort topológico (Kahn, O(n²) — a fase (A) tem poucas dezenas de componentes na prática, não
 precisa de nada mais esperto) sobre o GRAFO REAL de dependência: um candidato está pronto quando
 (a) todo nome em `after` já foi ordenado ou não corresponde a nenhum descritor desta fase (ordem

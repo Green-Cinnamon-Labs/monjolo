@@ -32,7 +32,10 @@ que ele existe.
 */
 pub use monjolo_macros::{actuator, controller, dynamic_model, sensor, tasks};
 
-pub use component::{attach_discovered_components, ComponentDescriptor, ComponentKind};
+pub use component::{
+    attach_discovered_components, describe_phase_a_execution_order, phase_a_execution_order,
+    ComponentDescriptor, ComponentKind,
+};
 
 /* Reexportado por inteiro (não só `submit!`/`collect!`/`iter`): o código que `#[actuator(...)]`
 gera vive dentro de quem USA a macro (ex.: tep-plant), então referencia `::monjolo::inventory::...`
