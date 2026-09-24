@@ -25,20 +25,17 @@ da própria unidade (`stringify!(X)`) — garante que ela já foi construída (e
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
+use syn::spanned::Spanned;
+use syn::visit_mut::{self, VisitMut};
 use syn::{ImplItem, ImplItemFn, ItemImpl, Type};
 
 use crate::dynamic_model::{field_init_from_slice, parse_key_spec, FieldKeySpec};
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "#[monjolo::tasks] não aceita argumentos — `disturbance = \"chave\"` é um atributo de \
-            MÉTODO agora (#[disturbance(key = \"...\")]), não do `impl` inteiro",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let task_args = match parse_task_args(attr) {
+        Ok(args) => args,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     let input = syn::parse_macro_input!(item as ItemImpl);
 
@@ -65,6 +62,27 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let has_marker = method.attrs.iter().any(|a| {
                     a.path().is_ident("need") || a.path().is_ident("offer") || a.path().is_ident("disturbance")
                 });
+                let is_signal_task = method.attrs.iter().any(|a| a.path().is_ident("task"));
+
+                if is_signal_task {
+                    if has_marker {
+                        return syn::Error::new_spanned(
+                            &method.sig,
+                            "#[task] não se combina com #[need]/#[offer]/#[disturbance] — num #[task] \
+                            o que o método lê/escreve vem de `sig::campo` no corpo, não de atributos",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    match build_signal_task(self_ty, owner_ident, &method, &task_args) {
+                        Ok((impl_method, task_def)) => {
+                            kept_items.push(impl_method);
+                            task_defs.push(task_def);
+                        }
+                        Err(err) => return err.to_compile_error().into(),
+                    }
+                    continue;
+                }
 
                 if !has_marker {
                     kept_items.push(quote! { #method });
@@ -93,6 +111,387 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/** Argumentos opcionais de `#[monjolo::tasks(species = CAMINHO, len = N)]`: só são necessários se
+algum `#[task]` do `impl` usa um sinal-mistura (`need::nome::<Fase>` / `offer::nome::<Fase>`), pra
+macro saber quantas componentes ele tem (`len`) e qual catálogo de nomes de espécie a `Mixture`
+montada carrega (`species`). Sem isso, só sinais escalares (`need::nome`/`offer::nome`) funcionam.
+*/
+struct TaskArgs {
+    species: Option<syn::Expr>,
+    len: Option<usize>,
+}
+
+fn parse_task_args(attr: TokenStream) -> syn::Result<TaskArgs> {
+    let mut species = None;
+    let mut len = None;
+    if attr.is_empty() {
+        return Ok(TaskArgs { species, len });
+    }
+
+    use syn::parse::Parser;
+    let metas = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated.parse(attr)?;
+    for meta in metas {
+        match meta {
+            syn::Meta::NameValue(pair) if pair.path.is_ident("species") => species = Some(pair.value),
+            syn::Meta::NameValue(pair) if pair.path.is_ident("len") => match &pair.value {
+                syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(n), .. }) => len = Some(n.base10_parse::<usize>()?),
+                other => return Err(syn::Error::new_spanned(other, "`len` precisa ser um inteiro literal")),
+            },
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    "#[monjolo::tasks] só aceita `species = CAMINHO, len = N` (e só se algum #[task] usa \
+                    um sinal-mistura); `disturbance = ...` é um atributo de MÉTODO agora \
+                    (#[disturbance(key = \"...\")])",
+                ))
+            }
+        }
+    }
+    Ok(TaskArgs { species, len })
+}
+
+/** Um sinal usado no corpo de um `#[task]`: `need::a__b` (lido) ou `offer::a__b = valor` (escrito).
+O nome do identificador É a chave, com `__` virando `.` (`reactor__temperature` →
+`"reactor.temperature"`). Com `::<Vapor>`/`::<Liquid>`/`::<Mixed>` no fim (`need::a__b::<Vapor>`), o
+sinal é uma MISTURA: uma `Mixture` de `len` componentes, publicada como `len` chaves (`a.b.a`,
+`a.b.b`, ...) e lida/escrita como um valor só — ninguém escreve array nenhum.
+*/
+struct SigUse {
+    field: syn::Ident,
+    keys: Vec<String>,
+    /* `None` = escalar; `Some(fase)` = mistura (nome da variante de `Phase`). */
+    phase: Option<String>,
+}
+
+struct SignalRewriter<'a> {
+    args: &'a TaskArgs,
+    needs: Vec<(syn::Ident, SigUse)>,
+    offers: Vec<(syn::Ident, SigUse)>,
+    error: Option<syn::Error>,
+}
+
+/* `need::nome` / `offer::nome` (opcionalmente `::<Fase>` no último segmento) → (é_offer, nome, fase). */
+fn sig_path(expr: &syn::Expr) -> Option<(bool, syn::Ident, Option<syn::Ident>)> {
+    let syn::Expr::Path(path_expr) = expr else { return None };
+    if path_expr.qself.is_some() || path_expr.path.leading_colon.is_some() || path_expr.path.segments.len() != 2 {
+        return None;
+    }
+    let first = &path_expr.path.segments[0];
+    let second = &path_expr.path.segments[1];
+    if !first.arguments.is_none() {
+        return None;
+    }
+    let is_offer = if first.ident == "offer" {
+        true
+    } else if first.ident == "need" {
+        false
+    } else {
+        return None;
+    };
+
+    let phase = match &second.arguments {
+        syn::PathArguments::None => None,
+        syn::PathArguments::AngleBracketed(generic) if generic.args.len() == 1 => match generic.args.first() {
+            Some(syn::GenericArgument::Type(syn::Type::Path(type_path))) if type_path.path.segments.len() == 1 => {
+                Some(type_path.path.segments[0].ident.clone())
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((is_offer, second.ident.clone(), phase))
+}
+
+fn is_compound_assign(op: &syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::AddAssign(_)
+            | syn::BinOp::SubAssign(_)
+            | syn::BinOp::MulAssign(_)
+            | syn::BinOp::DivAssign(_)
+            | syn::BinOp::RemAssign(_)
+    )
+}
+
+impl SignalRewriter<'_> {
+    fn fail(&mut self, span: proc_macro2::Span, message: &str) {
+        if self.error.is_none() {
+            self.error = Some(syn::Error::new(span, message));
+        }
+    }
+
+    /* Registra (ou reencontra) um sinal; devolve `None` (e guarda o erro) se algo não bate. */
+    fn register(&mut self, is_offer: bool, name: &syn::Ident, phase: Option<&syn::Ident>) -> Option<usize> {
+        let span = name.span();
+        let phase_name = match phase {
+            None => None,
+            Some(ident) => {
+                let text = ident.to_string();
+                if !matches!(text.as_str(), "Vapor" | "Liquid" | "Mixed") {
+                    self.fail(ident.span(), "a fase de um sinal-mistura precisa ser `Vapor`, `Liquid` ou `Mixed`");
+                    return None;
+                }
+                Some(text)
+            }
+        };
+
+        let other_list = if is_offer { &self.needs } else { &self.offers };
+        if other_list.iter().any(|(existing, _)| existing == name) {
+            self.fail(
+                span,
+                &format!(
+                    "`{name}` é lido (`need::`) E escrito (`offer::`) no mesmo #[task] — leia o valor numa \
+                    variável local antes, ou separe em duas tarefas"
+                ),
+            );
+            return None;
+        }
+
+        let list = if is_offer { &self.offers } else { &self.needs };
+        if let Some(position) = list.iter().position(|(existing, _)| existing == name) {
+            if list[position].1.phase != phase_name {
+                self.fail(span, &format!("`{name}` é usado ora como escalar, ora como mistura, ou com fases diferentes"));
+                return None;
+            }
+            return Some(position);
+        }
+
+        let base_key = name.to_string().replace("__", ".");
+        let keys = match &phase_name {
+            None => vec![base_key],
+            Some(_) => {
+                let (Some(len), Some(_)) = (self.args.len, &self.args.species) else {
+                    self.fail(
+                        span,
+                        "sinal-mistura precisa de `#[monjolo::tasks(species = CAMINHO, len = N)]` no `impl`",
+                    );
+                    return None;
+                };
+                (0..len).map(|i| format!("{base_key}.{}", (b'a' + i as u8) as char)).collect()
+            }
+        };
+
+        let prefix = if is_offer { "__offer_" } else { "__need_" };
+        let field = format_ident!("{}{}", prefix, name);
+        let entry = (name.clone(), SigUse { field, keys, phase: phase_name });
+        let list = if is_offer { &mut self.offers } else { &mut self.needs };
+        list.push(entry);
+        Some(list.len() - 1)
+    }
+
+    fn read_expr(&self, sig: &SigUse) -> syn::Expr {
+        let field = &sig.field;
+        match &sig.phase {
+            None => syn::parse_quote!(__sig.#field.get()),
+            Some(phase) => {
+                let phase = format_ident!("{}", phase);
+                let len = self.args.len.expect("checado em register()");
+                let species = self.args.species.as_ref().expect("checado em register()");
+                syn::parse_quote!(
+                    ::monjolo::chemistry::Mixture::<#len>::new(
+                        ::std::array::from_fn(|__i| __sig.#field[__i].get()),
+                        ::monjolo::chemistry::Phase::#phase,
+                        &#species,
+                    )
+                )
+            }
+        }
+    }
+
+    fn write_expr(&self, sig: &SigUse, value: &syn::Expr) -> syn::Expr {
+        let field = &sig.field;
+        match &sig.phase {
+            None => syn::parse_quote!(__sig.#field.set(#value)),
+            Some(_) => {
+                let len = self.args.len.expect("checado em register()");
+                syn::parse_quote!({
+                    let __mixture = #value;
+                    for __i in 0..#len {
+                        __sig.#field[__i].set(__mixture.component(__i));
+                    }
+                })
+            }
+        }
+    }
+}
+
+impl VisitMut for SignalRewriter<'_> {
+    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        let replacement: Option<syn::Expr> = match expr {
+            syn::Expr::Assign(assign) => match sig_path(&assign.left) {
+                Some((true, name, phase)) => {
+                    self.visit_expr_mut(&mut assign.right);
+                    match self.register(true, &name, phase.as_ref()) {
+                        Some(position) => {
+                            let value = assign.right.clone();
+                            let sig = &self.offers[position].1;
+                            Some(self.write_expr(sig, &value))
+                        }
+                        None => None,
+                    }
+                }
+                Some((false, name, _)) => {
+                    self.fail(name.span(), "`need::` só se lê — pra escrever um sinal use `offer::nome = valor;`");
+                    None
+                }
+                None => None,
+            },
+            syn::Expr::Binary(binary) if is_compound_assign(&binary.op) => {
+                if sig_path(&binary.left).is_some() {
+                    self.fail(
+                        binary.left.span(),
+                        "`offer::nome += ...` lê E escreve o mesmo sinal — calcule numa variável local e \
+                        escreva `offer::nome = valor;`",
+                    );
+                }
+                None
+            }
+            syn::Expr::Path(_) => match sig_path(expr) {
+                Some((false, name, phase)) => match self.register(false, &name, phase.as_ref()) {
+                    Some(position) => Some(self.read_expr(&self.needs[position].1)),
+                    None => None,
+                },
+                Some((true, name, _)) => {
+                    self.fail(name.span(), "`offer::` só se escreve (`offer::nome = valor;`) — pra ler use `need::nome`");
+                    None
+                }
+                None => None,
+            },
+            _ => None,
+        };
+
+        match replacement {
+            Some(new_expr) => *expr = new_expr,
+            None => visit_mut::visit_expr_mut(self, expr),
+        }
+    }
+}
+
+/** `#[task]` num método SEM parâmetros (além de `&self`) e SEM retorno: o corpo lê sinais com
+`need::nome` e escreve com `offer::nome = valor;` (ver `SignalRewriter`) — nenhum atributo, nenhum
+campo de struct. A tarefa gerada guarda um `Proxy` por sinal usado, `needs`/`offers` (e portanto a
+ordem de execução) saem da varredura, e o método reescrito recebe esses proxies como um parâmetro
+extra (`__sig`) — a macro é dona de tudo, do registro ao acesso, então nem precisa enxergar o struct.
+*/
+fn build_signal_task(
+    self_ty: &Type,
+    owner_ident: &syn::Ident,
+    method: &ImplItemFn,
+    args: &TaskArgs,
+) -> syn::Result<(TokenStream2, TokenStream2)> {
+    let method_name = &method.sig.ident;
+    let impl_name = format_ident!("__{}_impl", method_name);
+    let task_struct_name = format_ident!("__{}_{}_Task", owner_ident, method_name);
+
+    let extra_params = method.sig.inputs.iter().filter(|arg| !matches!(arg, syn::FnArg::Receiver(_))).count();
+    if extra_params != 0 || !matches!(method.sig.output, syn::ReturnType::Default) {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "#[task] não aceita parâmetros nem retorno — leia sinais com `need::nome` e escreva com \
+            `offer::nome = valor;` no corpo",
+        ));
+    }
+
+    let mut impl_method = method.clone();
+    impl_method.attrs.retain(|a| !a.path().is_ident("task"));
+    impl_method.sig.ident = impl_name.clone();
+    impl_method.sig.inputs.push(syn::parse_quote!(__sig: &#task_struct_name));
+
+    let mut rewriter = SignalRewriter {
+        args,
+        needs: Vec::new(),
+        offers: Vec::new(),
+        error: None,
+    };
+    rewriter.visit_block_mut(&mut impl_method.block);
+    if let Some(err) = rewriter.error {
+        return Err(err);
+    }
+
+    if rewriter.offers.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "#[task] sem nenhum `offer::nome = ...` — sem escrever sinal nenhum, esta tarefa não publicaria nada",
+        ));
+    }
+
+    let mut need_keys: Vec<String> = Vec::new();
+    let mut offer_keys: Vec<String> = Vec::new();
+    let mut proxy_fields: Vec<TokenStream2> = Vec::new();
+    let mut field_inits: Vec<TokenStream2> = Vec::new();
+
+    for (uses, keys, source) in [
+        (&rewriter.needs, &mut need_keys, "__needed"),
+        (&rewriter.offers, &mut offer_keys, "__offered"),
+    ] {
+        for (_, sig) in uses {
+            let start = keys.len();
+            keys.extend(sig.keys.iter().cloned());
+            let field = &sig.field;
+            match &sig.phase {
+                None => {
+                    proxy_fields.push(quote! { #field: ::monjolo::state_registry::Proxy });
+                    field_inits.push(field_init_from_slice(field, source, start, 1, None));
+                }
+                Some(_) => {
+                    let len = sig.keys.len();
+                    proxy_fields.push(quote! { #field: [::monjolo::state_registry::Proxy; #len] });
+                    field_inits.push(field_init_from_slice(field, source, start, len, Some(len)));
+                }
+            }
+        }
+    }
+
+    let descriptor_name: String = format!("{}::{}", owner_ident, method_name);
+    let need_refs = quote! { &[#(#need_keys),*] };
+    let offer_refs = quote! { &[#(#offer_keys),*] };
+
+    let task_def = quote! {
+        #[allow(non_camel_case_types, non_snake_case)]
+        struct #task_struct_name {
+            __owner: ::std::rc::Rc<#self_ty>,
+            #(#proxy_fields,)*
+        }
+
+        impl ::monjolo::dynamic_model::DynamicModel for #task_struct_name {
+            fn name(&self) -> &str {
+                #descriptor_name
+            }
+
+            fn evaluate(&self) {
+                self.__owner.#impl_name(self);
+            }
+        }
+
+        ::monjolo::inventory::submit! {
+            ::monjolo::ComponentDescriptor {
+                name: #descriptor_name,
+                kind: ::monjolo::ComponentKind::Dynamic,
+                after: &[::std::stringify!(#self_ty)],
+                needs: #need_refs,
+                offers: #offer_refs,
+                construct: |registry: &mut ::monjolo::state_registry::StateRegistry, _config: &::monjolo::snapshot::Snapshot| {
+                    let __owner = registry.instance::<#self_ty>(::std::stringify!(#self_ty)).unwrap_or_else(|| {
+                        ::std::panic!(
+                            "'{}' deveria já ter sido construída (offer_instance) antes de suas \
+                            tarefas — `after` deveria garantir isso",
+                            ::std::stringify!(#self_ty),
+                        )
+                    });
+                    #[allow(unused_variables)]
+                    let (__offered, __needed) = registry.subscribe(#offer_refs, #need_refs);
+                    ::std::option::Option::Some(::std::boxed::Box::new(#task_struct_name {
+                        __owner,
+                        #(#field_inits,)*
+                    }) as ::std::boxed::Box<dyn ::monjolo::dynamic_model::DynamicModel>)
+                },
+            }
+        }
+    };
+
+    Ok((quote! { #impl_method }, task_def))
 }
 
 /** `#[disturbance(key = "chave")]`, empilhado junto de `#[need]`/`#[offer]` num MÉTODO (não no

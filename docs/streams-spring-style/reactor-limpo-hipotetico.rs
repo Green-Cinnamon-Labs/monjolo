@@ -176,7 +176,11 @@ impl Reactor {
 
         let vapor_composition = partial_pressures.mole_fractions();
         let total_vapor_moles = pressure * volume_vapor / GAS_CONSTANT / temperature_k;
-        let vapor_moles = vapor + vapor_composition.scaled_by(total_vapor_moles); // vapor já é zero em 3..8, a escala já é zero em 0..3
+        /* CORRIGIDO: uma versão anterior deste rascunho fazia `vapor + vapor_composition.scaled_by(..)`,
+        o que contava A/B/C duas vezes (a composição também é não-zero em 0..3). Como P_i = n_i·R·T/V,
+        `total_vapor_moles * vapor_composition` já É o vetor de moles de vapor inteiro.
+        */
+        let vapor_moles = vapor_composition.scaled_by(total_vapor_moles);
 
         /* Cinética de reação: NÃO é "aplique a mesma fórmula nos 8 componentes" — é regra própria
         por reação, cada uma com constantes/expoentes diferentes. Fica fora de `Mixture` de propósito.

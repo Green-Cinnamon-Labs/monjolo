@@ -303,6 +303,55 @@ impl<const N: usize> std::ops::Sub for Mixture<N> {
     }
 }
 
+/** Rede de reações de uma planta — estequiometria e calor de cada uma de R reações sobre N espécies.
+Dado da PLANTA (os números), mesmo padrão de `Coefficients<N>`: este módulo só conhece a forma, quem
+monta a planta (ex.: `tep-plant`) fornece os valores.
+*/
+pub struct ReactionScheme<const N: usize, const R: usize> {
+    /** `stoichiometry[r][i]`: kmol da espécie `i` produzidos (+) ou consumidos (−) por kmol de avanço
+    da reação `r`.
+    */
+    pub stoichiometry: [[f64; N]; R],
+
+    /** Calor liberado por kmol de avanço da reação `r`. */
+    pub enthalpies: [f64; R],
+}
+
+/** Taxa de avanço de cada uma das R reações de um `ReactionScheme<N, R>` — o que a cinética calcula
+(taxas brutas por reação) e o que o resto do sistema realmente consome (consumo/produção líquida por
+espécie e calor total), sem cada unidade reimplementar a estequiometria com `for`/índice à mão.
+
+Diferente de `Mixture`, não tem fase: uma taxa é uma propriedade da reação, não de um vapor ou
+líquido.
+*/
+#[derive(Clone, Copy)]
+pub struct Reaction<const N: usize, const R: usize> {
+    rates: [f64; R],
+    scheme: &'static ReactionScheme<N, R>,
+}
+
+impl<const N: usize, const R: usize> Reaction<N, R> {
+    pub fn new(rates: [f64; R], scheme: &'static ReactionScheme<N, R>) -> Self {
+        Self { rates, scheme }
+    }
+
+    pub fn rate(&self, r: usize) -> f64 {
+        self.rates[r]
+    }
+
+    /** Consumo (−) ou produção (+) líquida de cada espécie, somando a contribuição de todas as
+    reações.
+    */
+    pub fn species_rates(&self) -> [f64; N] {
+        std::array::from_fn(|i| (0..R).map(|r| self.scheme.stoichiometry[r][i] * self.rates[r]).sum())
+    }
+
+    /** Calor total liberado por todas as reações. */
+    pub fn heat(&self) -> f64 {
+        (0..R).map(|r| self.scheme.enthalpies[r] * self.rates[r]).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +515,30 @@ mod tests {
         let constants = single_component_coefficients();
         let m = Mixture::new([1.0], Phase::Liquid, &SPECIES);
         assert_eq!(m.enthalpy(100.0, 0, &constants), mixture_enthalpy(&[1.0], 100.0, 0, &constants));
+    }
+
+    /* Rede de duas reações sobre 3 espécies (X, Y, Z): X + Y → Z (calor 5.0) e 2 Z → 3 X (calor 0.0) */
+    const TEST_SCHEME: ReactionScheme<3, 2> =
+        ReactionScheme { stoichiometry: [[-1.0, -1.0, 1.0], [3.0, 0.0, -2.0]], enthalpies: [5.0, 0.0] };
+
+    #[test]
+    fn reaction_species_rates_sum_the_stoichiometry_of_every_reaction() {
+        let reaction = Reaction::new([2.0, 1.0], &TEST_SCHEME);
+        // X: -1*2 + 3*1 = 1.0 | Y: -1*2 + 0*1 = -2.0 | Z: 1*2 + -2*1 = 0.0
+        assert_eq!(reaction.species_rates(), [1.0, -2.0, 0.0]);
+    }
+
+    #[test]
+    fn reaction_heat_sums_enthalpy_times_rate_of_every_reaction() {
+        let reaction = Reaction::new([2.0, 1.0], &TEST_SCHEME);
+        assert_eq!(reaction.heat(), 10.0);
+    }
+
+    #[test]
+    fn reaction_with_all_rates_at_zero_consumes_and_releases_nothing() {
+        let reaction = Reaction::new([0.0, 0.0], &TEST_SCHEME);
+        assert_eq!(reaction.species_rates(), [0.0, 0.0, 0.0]);
+        assert_eq!(reaction.heat(), 0.0);
+        assert_eq!(reaction.rate(1), 0.0);
     }
 }

@@ -710,6 +710,109 @@ mod tests {
         );
     }
 
+    /* Prova `#[task]` + `need::`/`offer::` (issue spec-tennessee-eastman#73, sucessor de
+    `#[need]`/`#[offer]` por método): nenhum atributo, parâmetro, retorno nem campo de struct — o
+    corpo lê `need::nome` e escreve `offer::nome = valor;`, e a macro registra as chaves (com `__`
+    virando `.`: `test__signal__b` é a chave "test.signal.b") e deriva `needs`/`offers` daí.
+    `make_c` está declarado ANTES de `make_b` no código-fonte de propósito, mas LÊ o que `make_b`
+    escreve, que por sua vez lê o que `make_a` escreve — a ordem de execução (a, b, c) só pode vir
+    do grafo derivado do corpo, não da ordem em que os métodos aparecem. `let base` prova que
+    variável local comum fica intocada pela reescrita.
+    */
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct SignalUnit {}
+
+    #[monjolo_macros::tasks]
+    impl SignalUnit {
+        #[task]
+        fn make_c(&self) {
+            offer::test__signal__c = need::test__signal__b * 10.0;
+        }
+
+        #[task]
+        fn make_b(&self) {
+            let base = 2.0;
+            offer::test__signal__b = base + need::test__signal__a;
+        }
+
+        #[task]
+        fn make_a(&self) {
+            offer::test__signal__a = 0.5;
+        }
+    }
+
+    #[test]
+    fn signal_tasks_derive_execution_order_from_the_body_not_source_order() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &Snapshot::from_pairs(&[]));
+        registry.borrow_mut().resolve().expect("todo need deveria ter um offer");
+
+        let (_, needed) = registry
+            .borrow_mut()
+            .subscribe(&[], &["test.signal.a", "test.signal.b", "test.signal.c"]);
+        registry.borrow_mut().resolve().expect("chaves já ofertadas deveriam resolver de novo sem erro");
+
+        root.evaluate();
+
+        assert_eq!(needed[0].get(), 0.5, "make_a deveria publicar a = 0.5");
+        assert_eq!(needed[1].get(), 2.5, "make_b deveria ler a = 0.5 e publicar b = 2.0 + 0.5");
+        assert_eq!(
+            needed[2].get(),
+            25.0,
+            "make_c está declarado antes de make_b no código-fonte, mas lê b — só dá 25.0 se a ordem \
+            veio do corpo (`need::`/`offer::`), não da ordem dos métodos"
+        );
+    }
+
+    /* Sinal-MISTURA: `need::nome::<Fase>` / `offer::nome::<Fase>` lêem/escrevem uma `Mixture` de
+    `len` componentes como UM valor só — a macro publica `len` chaves (`test.mix.pair.a`, `.b`) e
+    ninguém escreve array. Precisa de `species`/`len` no `#[monjolo::tasks(...)]`, e da feature
+    `chemistry` (é onde `Mixture` mora).
+    */
+    #[cfg(feature = "chemistry")]
+    const MIX_SPECIES: crate::chemistry::Species<2> = ["X", "Y"];
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct MixtureSignalUnit {}
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::tasks(species = MIX_SPECIES, len = 2)]
+    impl MixtureSignalUnit {
+        #[task]
+        fn make_total(&self) {
+            offer::test__mix__total = need::test__mix__pair::<Vapor>.total();
+        }
+
+        #[task]
+        fn make_pair(&self) {
+            offer::test__mix__pair::<Vapor> = crate::chemistry::Mixture::new([1.0, 3.0], crate::chemistry::Phase::Vapor, &MIX_SPECIES);
+        }
+    }
+
+    #[cfg(feature = "chemistry")]
+    #[test]
+    fn signal_tasks_publish_and_read_a_mixture_as_one_value() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &Snapshot::from_pairs(&[]));
+        registry.borrow_mut().resolve().expect("todo need deveria ter um offer");
+
+        let (_, needed) = registry
+            .borrow_mut()
+            .subscribe(&[], &["test.mix.pair.a", "test.mix.pair.b", "test.mix.total"]);
+        registry.borrow_mut().resolve().expect("chaves já ofertadas deveriam resolver de novo sem erro");
+
+        root.evaluate();
+
+        assert_eq!(needed[0].get(), 1.0, "componente `a` da mistura publicada");
+        assert_eq!(needed[1].get(), 3.0, "componente `b` da mistura publicada");
+        assert_eq!(needed[2].get(), 4.0, "make_total lê a mistura inteira como um valor só e soma");
+    }
+
     /* Prova #[need(prefix = ..., components = [...])] — forma array, usada por Flows (precisa de
     composições de 8 componentes de vários subsistemas ao mesmo tempo). Mesma mecânica de
     #[offer(...)] array, só do lado "needs" de subscribe().
