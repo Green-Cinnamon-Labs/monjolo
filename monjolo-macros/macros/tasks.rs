@@ -33,7 +33,8 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
         return syn::Error::new(
             proc_macro2::Span::call_site(),
-            "#[monjolo::tasks] não aceita argumentos",
+            "#[monjolo::tasks] não aceita argumentos — `disturbance = \"chave\"` é um atributo de \
+            MÉTODO agora (#[disturbance(key = \"...\")]), não do `impl` inteiro",
         )
         .to_compile_error()
         .into();
@@ -61,10 +62,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     for item in input.items {
         match item {
             ImplItem::Fn(method) => {
-                let has_marker = method
-                    .attrs
-                    .iter()
-                    .any(|a| a.path().is_ident("need") || a.path().is_ident("offer"));
+                let has_marker = method.attrs.iter().any(|a| {
+                    a.path().is_ident("need") || a.path().is_ident("offer") || a.path().is_ident("disturbance")
+                });
 
                 if !has_marker {
                     kept_items.push(quote! { #method });
@@ -93,6 +93,27 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/** `#[disturbance(key = "chave")]`, empilhado junto de `#[need]`/`#[offer]` num MÉTODO (não no
+`impl` inteiro — cada método tem sua própria chave, "duas tarefas no mesmo `impl` compartilhando o
+comando liga/desliga" seria um bug, não um recurso) — marca essa tarefa como `ComponentKind::
+Disturbance` em vez de `Dynamic` (MESMO grafo de `needs`/`offers`, MESMA fase (A), só rótulo de
+identidade diferente pra diagnóstico) E faz o próprio método virar o comando externo liga/desliga do
+distúrbio: a tarefa gerada TAMBÉM implementa `Actuator` (`write()` seta um `Proxy` escondido,
+catalogado sob `chave` via `offer_actuator()` — mesma exposição OPC-UA automática de qualquer outro
+atuador) e o valor atual desse comando chega ao método marcado como um parâmetro A MAIS, sempre o
+PRIMEIRO, na frente de qualquer `#[need(...)]` declarado — sem o usuário escrever `#[need(key =
+"chave")]` à mão nem manter um `inventory::submit!` separado só pra essa flag (ver
+`tep-plant/src/disturbance/idv1.rs`: um método só, `Disturbances::idv1`, é ao mesmo tempo o
+transform e o comando externo).
+*/
+fn parse_disturbance_attr(attr: &syn::Attribute) -> syn::Result<String> {
+    let meta: syn::MetaNameValue = attr.parse_args()?;
+    if !meta.path.is_ident("key") {
+        return Err(syn::Error::new_spanned(&meta.path, "esperado `key = \"chave\"`"));
+    }
+    crate::dynamic_model::expect_str_lit(&meta.value)
 }
 
 fn self_ty_ident(self_ty: &Type) -> syn::Result<&syn::Ident> {
@@ -127,17 +148,29 @@ fn build_task(
 
     let mut need_specs: Vec<FieldKeySpec> = Vec::new();
     let mut offer_specs: Vec<FieldKeySpec> = Vec::new();
-    /* Atributos que não são `#[need]`/`#[offer]` (doc comments, `#[allow(...)]`, etc.) não são
-    erro — `impl_method.attrs.retain(...)` abaixo já os preserva no método renomeado, intocados.
-    Só `need`/`offer` são consumidos aqui.
+    let mut disturbance_key: Option<String> = None;
+    /* Atributos que não são `#[need]`/`#[offer]`/`#[disturbance]` (doc comments, `#[allow(...)]`,
+    etc.) não são erro — `impl_method.attrs.retain(...)` abaixo já os preserva no método renomeado,
+    intocados. Só esses três são consumidos aqui.
     */
     for attr in &method.attrs {
         if attr.path().is_ident("need") {
             need_specs.push(parse_key_spec(attr)?);
         } else if attr.path().is_ident("offer") {
             offer_specs.push(parse_key_spec(attr)?);
+        } else if attr.path().is_ident("disturbance") {
+            if disturbance_key.is_some() {
+                return Err(syn::Error::new_spanned(attr, "atributo `disturbance` repetido no mesmo método"));
+            }
+            disturbance_key = Some(parse_disturbance_attr(attr)?);
         }
     }
+    let disturbance_key = disturbance_key.as_deref();
+    let kind = if disturbance_key.is_some() {
+        quote! { ::monjolo::ComponentKind::Disturbance }
+    } else {
+        quote! { ::monjolo::ComponentKind::Dynamic }
+    };
 
     if offer_specs.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -157,14 +190,25 @@ fn build_task(
         })
         .collect();
 
-    if params.len() != need_specs.len() {
+    /* `disturbance = "chave"` injeta um parâmetro A MAIS (o comando liga/desliga), sempre o
+    PRIMEIRO — não corresponde a nenhum `#[need(...)]` escrito pelo usuário, então a checagem 1:1
+    conta esse parâmetro implícito à parte.
+    */
+    let expected_params = need_specs.len() + if disturbance_key.is_some() { 1 } else { 0 };
+    if params.len() != expected_params {
         return Err(syn::Error::new_spanned(
             &method.sig,
             format!(
-                "{} parâmetro(s) declarado(s) mas {} atributo(s) #[need(...)] — precisa bater \
-                1:1, na ordem em que aparecem (1º #[need] = 1º parâmetro, etc.)",
+                "{} parâmetro(s) declarado(s) mas {} esperado(s) ({} atributo(s) #[need(...)]{}) — \
+                precisa bater 1:1, na ordem em que aparecem",
                 params.len(),
+                expected_params,
                 need_specs.len(),
+                if disturbance_key.is_some() {
+                    " + 1 pro comando liga/desliga injetado por `disturbance = \"...\"`, sempre o primeiro"
+                } else {
+                    ""
+                },
             ),
         ));
     }
@@ -246,24 +290,33 @@ fn build_task(
         result_bindings.push(result_binding);
     }
 
+    /* Se `disturbance_key` existe, o valor do comando liga/desliga (lido do `Proxy` escondido
+    `__active`) entra como o PRIMEIRO argumento da chamada — antes de qualquer `#[need(...)]`
+    declarado pelo usuário, casando com a checagem de parâmetros acima.
+    */
+    let active_value_expr = disturbance_key.map(|_| quote! { self.__active.get() });
+    let call_value_exprs: Vec<TokenStream2> =
+        active_value_expr.into_iter().chain(need_value_exprs.iter().cloned()).collect();
+
     let call_and_distribute = if multiple_offers {
         quote! {
-            let (#(#result_bindings),*) = self.__owner.#impl_name(#(#need_value_exprs),*);
+            let (#(#result_bindings),*) = self.__owner.#impl_name(#(#call_value_exprs),*);
             #(#offer_set_stmts)*
         }
     } else {
         quote! {
-            let __result = self.__owner.#impl_name(#(#need_value_exprs),*);
+            let __result = self.__owner.#impl_name(#(#call_value_exprs),*);
             #(#offer_set_stmts)*
         }
     };
 
-    // Método reescrito: mesmo corpo/assinatura, renomeado, sem os atributos #[need]/#[offer] (não
-    // são atributos de verdade — sobreviver até o compilador seria "cannot find attribute").
+    // Método reescrito: mesmo corpo/assinatura, renomeado, sem os atributos #[need]/#[offer]/
+    // #[disturbance] (não são atributos de verdade — sobreviver até o compilador seria "cannot
+    // find attribute").
     let mut impl_method = method.clone();
-    impl_method
-        .attrs
-        .retain(|a| !(a.path().is_ident("need") || a.path().is_ident("offer")));
+    impl_method.attrs.retain(|a| {
+        !(a.path().is_ident("need") || a.path().is_ident("offer") || a.path().is_ident("disturbance"))
+    });
     impl_method.sig.ident = impl_name.clone();
     let impl_method_tokens = quote! { #impl_method };
 
@@ -272,10 +325,57 @@ fn build_task(
     let offer_refs = quote! { &[#(#offer_keys),*] };
     let need_refs = quote! { &[#(#need_keys),*] };
 
+    /* Peças geradas SÓ quando `disturbance = "chave"`: campo `__active` (o comando, um `Proxy`
+    comum — mesma mecânica de `#[need]`/`#[offer]`, só que nunca exposto como parâmetro do método
+    do usuário além do valor já embutido em `call_value_exprs` acima), `impl Actuator` (`write()`
+    seta esse `Proxy`), e a construção via `Rc` (não `Box` direto) pra poder catalogar a MESMA
+    instância em `offer_actuator()` e ainda entrar na árvore de `evaluate()` — mesmo truque de
+    `impl<T: DynamicModel + ?Sized> DynamicModel for Rc<T>` que `#[actuator(...)]` já usa.
+    */
+    let active_field = disturbance_key.map(|_| quote! { __active: ::monjolo::state_registry::Proxy, });
+    let active_field_init = disturbance_key.map(|_| quote! { __active: __active_offered[0].clone(), });
+    let active_subscribe = disturbance_key.map(|key| quote! {
+        let (__active_offered, _) = registry.subscribe(&[#key], &[]);
+    });
+    let actuator_impl = disturbance_key.map(|_| quote! {
+        impl ::monjolo::actuator::Actuator for #task_struct_name {
+            fn write(&self, value: f64) {
+                self.__active.set(value);
+            }
+        }
+    });
+
+    let construct_body = if let Some(key) = disturbance_key {
+        quote! {
+            #active_subscribe
+            let (__offered, __needed) = registry.subscribe(#offer_refs, #need_refs);
+            let __instance = ::std::rc::Rc::new(#task_struct_name {
+                __owner,
+                #active_field_init
+                #(#need_field_inits,)*
+                #(#offer_field_inits,)*
+            });
+            registry.offer_actuator(#key, __instance.clone());
+            ::std::option::Option::Some(
+                ::std::boxed::Box::new(__instance) as ::std::boxed::Box<dyn ::monjolo::dynamic_model::DynamicModel>
+            )
+        }
+    } else {
+        quote! {
+            let (__offered, __needed) = registry.subscribe(#offer_refs, #need_refs);
+            ::std::option::Option::Some(::std::boxed::Box::new(#task_struct_name {
+                __owner,
+                #(#need_field_inits,)*
+                #(#offer_field_inits,)*
+            }) as ::std::boxed::Box<dyn ::monjolo::dynamic_model::DynamicModel>)
+        }
+    };
+
     let task_def = quote! {
         #[allow(non_camel_case_types)]
         struct #task_struct_name {
             __owner: ::std::rc::Rc<#self_ty>,
+            #active_field
             #(#need_proxy_fields,)*
             #(#offer_proxy_fields,)*
         }
@@ -290,10 +390,12 @@ fn build_task(
             }
         }
 
+        #actuator_impl
+
         ::monjolo::inventory::submit! {
             ::monjolo::ComponentDescriptor {
                 name: #descriptor_name,
-                kind: ::monjolo::ComponentKind::Dynamic,
+                kind: #kind,
                 after: &[::std::stringify!(#self_ty)],
                 needs: #need_refs,
                 offers: #offer_refs,
@@ -305,12 +407,7 @@ fn build_task(
                             ::std::stringify!(#self_ty),
                         )
                     });
-                    let (__offered, __needed) = registry.subscribe(#offer_refs, #need_refs);
-                    ::std::option::Option::Some(::std::boxed::Box::new(#task_struct_name {
-                        __owner,
-                        #(#need_field_inits,)*
-                        #(#offer_field_inits,)*
-                    }) as ::std::boxed::Box<dyn ::monjolo::dynamic_model::DynamicModel>)
+                    #construct_body
                 },
             }
         }

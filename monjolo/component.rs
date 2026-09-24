@@ -71,6 +71,17 @@ não entram em `root`, mas `construct()` ainda roda (é o que cataloga a instân
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentKind {
     Dynamic,
+    /** Mesma fase (A) de `Dynamic` — participa do MESMO `sort_phase_a`, misturado no mesmo grafo de
+    `needs`/`offers` (ver `attach_discovered_components`), não um bucket fixo separado como
+    `Actuator`/`Controller`/`Sensor`. Existe como valor próprio (não reaproveita `Dynamic`) só pra
+    identidade/diagnóstico — ex.: `describe_phase_a_execution_order()` consegue apontar "isto é um
+    distúrbio, não física" sem precisar de outra fonte de verdade. Um distúrbio típico `#[need]` a
+    grandeza NOMINAL (publicada por quem a possui de verdade) e `#[offer]` a mesma grandeza de volta,
+    já `write()`-alterada ou não (nunca acrescenta campo/chave nova) — quem consome só enxerga a
+    chave pública, nunca sabe que existe um distúrbio no meio (ver `#[monjolo::tasks(disturbance =
+    "chave")]`, issue spec-tennessee-eastman#73).
+    */
+    Disturbance,
     Actuator,
     Controller,
     Sensor,
@@ -129,7 +140,7 @@ pub fn attach_discovered_components(root: &mut Composite, registry: &mut StateRe
 
     for descriptor in inventory::iter::<ComponentDescriptor> {
         match descriptor.kind {
-            ComponentKind::Dynamic => phase_a.push(descriptor),
+            ComponentKind::Dynamic | ComponentKind::Disturbance => phase_a.push(descriptor),
             ComponentKind::Actuator => phase_b.push(descriptor),
             ComponentKind::Controller => phase_c.push(descriptor),
             ComponentKind::Sensor => sensors.push(descriptor),
@@ -152,8 +163,9 @@ pub fn attach_discovered_components(root: &mut Composite, registry: &mut StateRe
     }
 }
 
-/** Ordem de execução REAL da fase (A) — física (`ComponentKind::Dynamic`), onde mora o acoplamento
-entre unidades que este artefato existe pra inspecionar (issue spec-tennessee-eastman#71). Mesma
+/** Ordem de execução REAL da fase (A) — física (`ComponentKind::Dynamic`) MAIS distúrbios
+(`ComponentKind::Disturbance`, mesmo grafo/mesmo sort — ver comentário do enum), onde mora o
+acoplamento entre unidades que este artefato existe pra inspecionar (issue spec-tennessee-eastman#71). Mesma
 lógica que `attach_discovered_components` já roda por dentro, só que sem construir nada — não
 precisa de `StateRegistry`/`Snapshot`/planta nenhuma, porque `name`/`after`/`needs`/`offers` são
 todos `&'static`: já existem completos assim que o binário termina de linkar (é isso que
@@ -163,7 +175,7 @@ próprio `Runtime::bootstrap()` — sem nenhum outro pré-requisito.
 */
 pub fn phase_a_execution_order() -> Vec<&'static ComponentDescriptor> {
     let phase_a: Vec<&'static ComponentDescriptor> = inventory::iter::<ComponentDescriptor>()
-        .filter(|descriptor| descriptor.kind == ComponentKind::Dynamic)
+        .filter(|descriptor| matches!(descriptor.kind, ComponentKind::Dynamic | ComponentKind::Disturbance))
         .collect();
     sort_phase_a(phase_a)
 }
@@ -641,6 +653,60 @@ mod tests {
             30.0,
             "DownstreamTaskUnit::tripled deveria ler 20.0 já publicado por TaskDrivenUnit::doubled \
             (SEM after declarado entre as duas unidades) e publicar 30.0",
+        );
+    }
+
+    /* Prova `#[disturbance(key = "chave")]` (issue spec-tennessee-eastman#73), atributo de MÉTODO
+    (não do `impl` inteiro — cada método tem sua própria chave): mesma mecânica de
+    `#[monjolo::tasks]` comum (need→offer, grafo automático por chave, `after` auto-injetado) — o
+    `ComponentKind` do descritor gerado é `Disturbance`, não `Dynamic`, E o próprio método vira o
+    comando externo liga/desliga (a tarefa gerada também implementa `Actuator`, catalogada sob
+    `chave`). Reusa `TaskDrivenUnit` (acima) como fonte do valor nominal, pra provar que os dois
+    kinds convivem no MESMO grafo/fase sem `after` nenhum entre eles.
+    */
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct DisturbedUnit {}
+
+    #[monjolo_macros::tasks]
+    impl DisturbedUnit {
+        #[disturbance(key = "test.disturbance.flag")]
+        #[need(key = "test.task_unit.doubled")]
+        #[offer(key = "test.task_unit.disturbed")]
+        fn perturb(&self, active: f64, nominal: f64) -> f64 {
+            if active != 0.0 { nominal + 1.0 } else { nominal }
+        }
+    }
+
+    #[test]
+    fn tasks_disturbance_flag_stamps_kind_and_is_its_own_external_command() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[("test.task_unit.state.level", 10.0)]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+
+        let (_, needed) = registry.borrow_mut().subscribe(&[], &["test.task_unit.disturbed"]);
+        registry.borrow_mut().resolve().expect("chave já ofertada deveria resolver de novo sem erro");
+
+        root.evaluate();
+        assert_eq!(needed[0].get(), 20.0, "desligado: passa o nominal (20.0, de TaskDrivenUnit::doubled) sem alterar");
+
+        let command = registry
+            .borrow()
+            .actuator("test.disturbance.flag")
+            .expect("a própria tarefa deveria ter se catalogado como Actuator sob a chave do disturbance");
+        command.write(1.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 21.0, "ligado: nominal + 1, sem nenhum #[need] declarado à mão pro comando");
+
+        let descriptor = inventory::iter::<ComponentDescriptor>()
+            .find(|d| d.name == "DisturbedUnit::perturb")
+            .expect("a tarefa deveria ter se registrado no inventory");
+        assert_eq!(
+            descriptor.kind,
+            ComponentKind::Disturbance,
+            "#[monjolo::tasks(disturbance = ...)] deveria carimbar ComponentKind::Disturbance, não Dynamic",
         );
     }
 

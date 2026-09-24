@@ -143,6 +143,166 @@ pub fn liquid_density<const N: usize>(x: &[f64; N], t: f64, constants: &Coeffici
     1.0 / v
 }
 
+/** Fase física de uma `Mixture` — vapor, líquido, ou `Mixed` (combinação de mais de uma fase, ex.:
+o inventário TOTAL de um vaso que tem as duas ao mesmo tempo). `Mixture::add` degrada pra `Mixed`
+automaticamente quando soma duas fases diferentes; somar a mesma fase preserva a fase.
+*/
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Vapor,
+    Liquid,
+    Mixed,
+}
+
+/** Catálogo de nomes de componente ("A", "B", ...), compartilhado por referência `&'static` — várias
+`Mixture` do mesmo processo apontam pro MESMO catálogo, sem duplicar as strings por instância.
+Definido por quem monta a planta (ex.: `tep-plant`), não por este módulo — nomear componentes é
+identidade da planta, não da matemática de mistura.
+*/
+pub type Species<const N: usize> = [&'static str; N];
+
+/** Composição/inventário de N espécies químicas — o `[f64; N]` que descreve uma corrente, um vaso,
+um estado, deixa de ser um array cru repetido em cada unidade e vira um tipo com identidade própria:
+sabe seu total, sua fase, o nome de cada componente, e as operações que já se repetiam por toda
+parte (soma, normalização, produto escalar, pressão parcial) como método nomeado, não `for i in
+0..N` reescrito a cada chamada.
+
+Filosofia: a maioria das `Mixture` do sistema nasce de OUTRA `Mixture` já existente — soma (`+`),
+subtração (`-`), escala (`scaled_by`), normalização (`mole_fractions`) — nunca de um array digitado
+à mão. `Mixture::new`/`Mixture::zero` existem pra fronteira (ex.: o feed externo de uma planta,
+que introduz massa nova vinda de fora do sistema) ou pra teste — código que só COMBINA misturas que
+já existem deveria raramente precisar delas.
+*/
+#[derive(Clone, Copy, Debug)]
+pub struct Mixture<const N: usize> {
+    values: [f64; N],
+    phase: Phase,
+    species: &'static Species<N>,
+}
+
+impl<const N: usize> Mixture<N> {
+    /** Todas as N posições em zero — pra quando o valor inicial é "nada aqui ainda", sem o chamador
+    precisar escrever `[0.0; N]` toda vez.
+    */
+    pub fn zero(phase: Phase, species: &'static Species<N>) -> Self {
+        Self { values: [0.0; N], phase, species }
+    }
+
+    pub fn new(values: [f64; N], phase: Phase, species: &'static Species<N>) -> Self {
+        Self { values, phase, species }
+    }
+
+    /** Constrói a partir de um array MENOR (M componentes), colocado a partir de `offset`, com o
+    resto das N posições em zero — pra quando só parte dos componentes faz sentido aqui (ex.: o
+    vapor do reator só tem A/B/C, mora nas 3 primeiras posições de um total de 8; sem isto, quem
+    chama precisaria escrever `std::array::from_fn` + `if` toda vez que isso acontece).
+    */
+    pub fn at<const M: usize>(offset: usize, values: &[f64; M], phase: Phase, species: &'static Species<N>) -> Self {
+        let mut full = [0.0; N];
+        full[offset..offset + M].copy_from_slice(values);
+        Self { values: full, phase, species }
+    }
+
+    pub fn component(&self, i: usize) -> f64 {
+        self.values[i]
+    }
+
+    pub fn name(&self, i: usize) -> &'static str {
+        self.species[i]
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    pub fn as_array(&self) -> [f64; N] {
+        self.values
+    }
+
+    pub fn total(&self) -> f64 {
+        self.values.iter().sum()
+    }
+
+    /** Moles (ou o que quer que `self` represente) → fração do próprio total. */
+    pub fn mole_fractions(&self) -> Self {
+        let total = self.total();
+        Self { values: std::array::from_fn(|i| self.values[i] / total), phase: self.phase, species: self.species }
+    }
+
+    pub fn scaled_by(&self, factor: f64) -> Self {
+        Self { values: std::array::from_fn(|i| self.values[i] * factor), phase: self.phase, species: self.species }
+    }
+
+    /** Produto escalar componente-a-componente com um array externo (ex.: composição · peso
+    molecular = peso molecular médio da mistura).
+    */
+    pub fn dot(&self, other: &[f64; N]) -> f64 {
+        (0..N).map(|i| self.values[i] * other[i]).sum()
+    }
+
+    /** Quanto o total DESTA mistura representa do total de OUTRA que a contém — ex.: a fase vapor
+    de um vaso sobre o inventário total do mesmo vaso.
+    */
+    pub fn fraction_of(&self, whole: &Self) -> f64 {
+        self.total() / whole.total()
+    }
+
+    /** Pressão parcial de gás ideal (P_i = n_i·R·T/V) — só fisicamente correto pra componentes que
+    `self` representa como moles de vapor genuíno (não como fração molar de uma fase líquida).
+    */
+    pub fn ideal_gas_pressure(&self, temperature_k: f64, volume: f64, gas_constant: f64) -> Self {
+        Self {
+            values: std::array::from_fn(|i| self.values[i] * gas_constant * temperature_k / volume),
+            phase: self.phase,
+            species: self.species,
+        }
+    }
+
+    /** Pressão de vapor tipo Antoine (exp(AVP + BVP/(T+CVP))) × fração molar — a contribuição de
+    componentes semi-voláteis de uma fase líquida em equilíbrio líquido-vapor. Componentes sem
+    equação de Antoine (avp=bvp=cvp=0) dão `exp(0) * fração = fração`, não zero — quem chama
+    continua responsável por saber quais índices fazem sentido fisicamente aqui.
+    */
+    pub fn vapor_pressure(&self, temperature: f64, constants: &Coefficients<N>) -> Self {
+        Self {
+            values: std::array::from_fn(|i| {
+                (constants.avp[i] + constants.bvp[i] / (temperature + constants.cvp[i])).exp() * self.values[i]
+            }),
+            phase: self.phase,
+            species: self.species,
+        }
+    }
+
+    /** Atalho pra `mixture_enthalpy(&self.as_array(), ...)` — mesma correlação, só chamada como
+    método em vez de função livre com o array desembrulhado à mão.
+    */
+    pub fn enthalpy(&self, temperature: f64, ity: i32, constants: &Coefficients<N>) -> f64 {
+        mixture_enthalpy(&self.values, temperature, ity, constants)
+    }
+}
+
+/** Soma componente-a-componente. Fase resultante: preserva a fase quando as duas são iguais,
+degrada pra `Phase::Mixed` quando somam fases diferentes (ex.: vapor + líquido = inventário total
+de um vaso, que genuinamente tem as duas fases ao mesmo tempo).
+*/
+impl<const N: usize> std::ops::Add for Mixture<N> {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        let phase = if self.phase == other.phase { self.phase } else { Phase::Mixed };
+        Self { values: std::array::from_fn(|i| self.values[i] + other.values[i]), phase, species: self.species }
+    }
+}
+
+/** Subtração componente-a-componente — preserva a fase de `self` (ex.: "o que sai desta fase",
+não uma combinação de fases diferentes).
+*/
+impl<const N: usize> std::ops::Sub for Mixture<N> {
+    type Output = Self;
+    fn sub(self, other: Self) -> Self {
+        Self { values: std::array::from_fn(|i| self.values[i] - other.values[i]), phase: self.phase, species: self.species }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +360,111 @@ mod tests {
         let x = [1.0];
         // V = 1.0 * 1.0 / (1.0 + 0.0) = 1.0 -> densidade = 1.0
         assert_eq!(liquid_density(&x, 42.0, &constants), 1.0);
+    }
+
+    const TEST_SPECIES: Species<3> = ["X", "Y", "Z"];
+
+    #[test]
+    fn zero_is_all_zero_without_the_caller_writing_it() {
+        let m = Mixture::zero(Phase::Vapor, &TEST_SPECIES);
+        assert_eq!(m.as_array(), [0.0, 0.0, 0.0]);
+        assert_eq!(m.phase(), Phase::Vapor);
+        assert_eq!(m.name(1), "Y");
+    }
+
+    #[test]
+    fn at_places_a_smaller_array_at_an_offset_and_zero_pads_the_rest() {
+        let m: Mixture<5> = Mixture::at(2, &[7.0, 8.0], Phase::Liquid, &["a", "b", "c", "d", "e"]);
+        assert_eq!(m.as_array(), [0.0, 0.0, 7.0, 8.0, 0.0]);
+    }
+
+    #[test]
+    fn total_sums_every_component() {
+        let m = Mixture::new([1.0, 2.0, 3.0], Phase::Liquid, &TEST_SPECIES);
+        assert_eq!(m.total(), 6.0);
+    }
+
+    #[test]
+    fn mole_fractions_normalizes_by_the_own_total_and_keeps_the_phase() {
+        let m = Mixture::new([1.0, 1.0, 2.0], Phase::Liquid, &TEST_SPECIES);
+        let fractions = m.mole_fractions();
+        assert_eq!(fractions.as_array(), [0.25, 0.25, 0.5]);
+        assert_eq!(fractions.phase(), Phase::Liquid);
+    }
+
+    #[test]
+    fn scaled_by_multiplies_every_component() {
+        let m = Mixture::new([1.0, 2.0, 3.0], Phase::Vapor, &TEST_SPECIES);
+        assert_eq!(m.scaled_by(10.0).as_array(), [10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn dot_is_the_componentwise_scalar_product() {
+        let m = Mixture::new([1.0, 2.0, 3.0], Phase::Vapor, &TEST_SPECIES);
+        assert_eq!(m.dot(&[10.0, 10.0, 10.0]), 60.0);
+    }
+
+    #[test]
+    fn fraction_of_divides_totals() {
+        let part = Mixture::new([1.0, 1.0, 0.0], Phase::Vapor, &TEST_SPECIES);
+        let whole = Mixture::new([2.0, 2.0, 4.0], Phase::Mixed, &TEST_SPECIES);
+        assert_eq!(part.fraction_of(&whole), 2.0 / 8.0);
+    }
+
+    #[test]
+    fn add_preserves_phase_when_both_sides_match_but_degrades_to_mixed_otherwise() {
+        let vapor_a = Mixture::new([1.0, 0.0, 0.0], Phase::Vapor, &TEST_SPECIES);
+        let vapor_b = Mixture::new([0.0, 1.0, 0.0], Phase::Vapor, &TEST_SPECIES);
+        assert_eq!((vapor_a + vapor_b).phase(), Phase::Vapor);
+        assert_eq!((vapor_a + vapor_b).as_array(), [1.0, 1.0, 0.0]);
+
+        let liquid = Mixture::new([0.0, 0.0, 1.0], Phase::Liquid, &TEST_SPECIES);
+        assert_eq!((vapor_a + liquid).phase(), Phase::Mixed);
+        assert_eq!((vapor_a + liquid).as_array(), [1.0, 0.0, 1.0]);
+    }
+
+    /** Prova que `Add` sozinho já cobre o caso que motivou um `splice`/merge por faixa de índice
+    num rascunho anterior (ver tep-plant/docs/streams-spring-style): duas Mixture, cada uma válida
+    só numa faixa de índices e ZERO na outra (por construção — `zero()` + preencher só a parte que
+    faz sentido), somadas dão exatamente a combinação esperada, sem precisar de um método à parte.
+    */
+    #[test]
+    fn add_combines_two_zero_padded_range_specific_mixtures_without_needing_a_splice_method() {
+        let gas_partial = Mixture::new([5.0, 0.0, 0.0], Phase::Vapor, &TEST_SPECIES); // válido só no índice 0
+        let liquid_partial = Mixture::new([0.0, 0.0, 9.0], Phase::Liquid, &TEST_SPECIES); // válido só no índice 2
+        assert_eq!((gas_partial + liquid_partial).as_array(), [5.0, 0.0, 9.0]);
+    }
+
+    #[test]
+    fn sub_preserves_the_phase_of_self() {
+        let inflow = Mixture::new([5.0, 5.0, 5.0], Phase::Vapor, &TEST_SPECIES);
+        let outflow = Mixture::new([1.0, 2.0, 3.0], Phase::Liquid, &TEST_SPECIES);
+        let result = inflow - outflow;
+        assert_eq!(result.as_array(), [4.0, 3.0, 2.0]);
+        assert_eq!(result.phase(), Phase::Vapor);
+    }
+
+    #[test]
+    fn ideal_gas_pressure_matches_pv_nrt() {
+        let m = Mixture::new([2.0, 0.0, 0.0], Phase::Vapor, &TEST_SPECIES);
+        // P = n*R*T/V = 2.0 * 10.0 * 300.0 / 100.0 = 60.0
+        assert_eq!(m.ideal_gas_pressure(300.0, 100.0, 10.0).component(0), 60.0);
+    }
+
+    #[test]
+    fn vapor_pressure_matches_antoine_times_mole_fraction() {
+        const SPECIES: Species<1> = ["X"];
+        let constants = single_component_coefficients();
+        let m = Mixture::new([0.5], Phase::Liquid, &SPECIES);
+        // avp=bvp=cvp=0 -> exp(0) = 1.0 -> resultado = 1.0 * fração = 0.5
+        assert_eq!(m.vapor_pressure(42.0, &constants).component(0), 0.5);
+    }
+
+    #[test]
+    fn mixture_enthalpy_method_matches_the_free_function() {
+        const SPECIES: Species<1> = ["X"];
+        let constants = single_component_coefficients();
+        let m = Mixture::new([1.0], Phase::Liquid, &SPECIES);
+        assert_eq!(m.enthalpy(100.0, 0, &constants), mixture_enthalpy(&[1.0], 100.0, 0, &constants));
     }
 }
