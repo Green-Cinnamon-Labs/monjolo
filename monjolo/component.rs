@@ -766,7 +766,7 @@ mod tests {
         );
     }
 
-    /* Sinal-MISTURA: `need::nome::<Fase>` / `offer::nome::<Fase>` lêem/escrevem uma `Mixture` de
+    /* Sinal-MISTURA: `need::nome::<Mixture>` / `offer::nome::<Mixture>` lêem/escrevem uma `Mixture` de
     `len` componentes como UM valor só — a macro publica `len` chaves (`test.mix.pair.a`, `.b`) e
     ninguém escreve array. Precisa de `species`/`len` no `#[monjolo::tasks(...)]`, e da feature
     `chemistry` (é onde `Mixture` mora).
@@ -783,12 +783,12 @@ mod tests {
     impl MixtureSignalUnit {
         #[task]
         fn make_total(&self) {
-            offer::test__mix__total = need::test__mix__pair::<Vapor>.total();
+            offer::test__mix__total = need::test__mix__pair::<Mixture>.total();
         }
 
         #[task]
         fn make_pair(&self) {
-            offer::test__mix__pair::<Vapor> = crate::chemistry::Mixture::new([1.0, 3.0], crate::chemistry::Phase::Vapor, &MIX_SPECIES);
+            offer::test__mix__pair::<Mixture> = crate::chemistry::Mixture::new([1.0, 3.0], &MIX_SPECIES);
         }
     }
 

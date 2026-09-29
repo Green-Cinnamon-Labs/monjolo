@@ -34,3 +34,9 @@ Em toda unidade de `tep-plant` (`Reactor`, `Separator`, `Stripper`, `Compressor`
 - Catálogo `Species<8>` do TEP (`["A",...,"H"]`) ainda não foi definido em `tep-plant/src/physics/constants.rs`.
 - Nenhum construtor "só pro Feed" existe pra dar dentes de verdade ao princípio 3 — hoje é só convenção documentada.
 - A pergunta de como `#[need]`/`#[offer]` (a macro de `monjolo-macros`) publicaria/consumiria uma `Mixture` inteira via StateRegistry (que só entende `f64` por chave) continua em aberto — isso é o mesmo problema de fundo da discussão de Stream/Flow (`tep-plant/docs/10-streams.md`), ainda não resolvido.
+
+## Atualização (2026-09-26): `Phase` saiu, e a receita de reações ganhou um builder
+
+Nenhum cálculo olhava a fase de uma `Mixture` (ela só era gravada na criação e lida em `Add` e nos testes), e ainda gerou o abuso de `Phase::Mixed` para "não se aplica", então `Phase` foi removido: `Mixture::new(valores, &espécies)`. Quem dá o significado de vapor ou líquido é o nome da variável de quem usa. Um cálculo que depende do estado físico (gás ideal para os componentes não condensáveis, Antoine para os condensáveis) já era escolhido pelo método, não pela fase carregada. Os princípios 1 e 4 acima continuam valendo pelo resto da interface (soma, nome de cada componente, fração do todo); só a parte "em que fase está" deixou de existir como dado.
+
+`ReactionScheme` e `Reaction` (uma tabela de índices mais um vetor de taxas) viraram `Reactions` e `ReactionOutcome`: `Reactions::new(&espécies).add("A + C + D -> G", calor, |T, p| ...)` monta as reações pelo NOME das espécies, cada uma com a própria receita, o próprio calor e a própria fórmula de velocidade, e `at(T, pressões parciais, volume)` devolve um `ReactionOutcome` (`species_rates` como `Mixture` e `heat`). A constante dos gases (`GAS_CONSTANT`) e a fórmula de Arrhenius (`arrhenius`) também moram em `monjolo::chemistry`, e `Mixture::get("A")` lê uma espécie pelo nome.

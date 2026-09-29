@@ -143,15 +143,19 @@ pub fn liquid_density<const N: usize>(x: &[f64; N], t: f64, constants: &Coeffici
     1.0 / v
 }
 
-/** Fase física de uma `Mixture` — vapor, líquido, ou `Mixed` (combinação de mais de uma fase, ex.:
-o inventário TOTAL de um vaso que tem as duas ao mesmo tempo). `Mixture::add` degrada pra `Mixed`
-automaticamente quando soma duas fases diferentes; somar a mesma fase preserva a fase.
+/** Constante universal dos gases, R, nas unidades internas do TEP (`RG` em `teprob.f`): pressão em
+mmHg, volume em ft³, quantidade em lbmol e temperatura em K — 998,9 mmHg·ft³/(lbmol·K). Sai da
+conta 10,7316 psia·ft³/(lbmol·°R) × 51,7149 mmHg/psia × 1,8 °R/K. Vive aqui, e não em cada unidade,
+porque não é dado de nenhuma unidade: é a mesma constante em qualquer vaso da planta.
 */
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
-    Vapor,
-    Liquid,
-    Mixed,
+pub const GAS_CONSTANT: f64 = 998.9;
+
+/** Lei de Arrhenius: quão rápido uma reação anda numa dada temperatura, `exp(a − Ea / (R·T))`.
+`a` é o termo constante (o logaritmo do fator de frequência), `activation_energy` é a energia de
+ativação em cal/mol (quanto maior, mais a reação acelera ao esquentar) e `R` é 1,987 cal/(mol·K).
+*/
+pub fn arrhenius(a: f64, activation_energy: f64, temperature_k: f64) -> f64 {
+    (a - activation_energy / 1.987 / temperature_k).exp()
 }
 
 /** Catálogo de nomes de componente ("A", "B", ...), compartilhado por referência `&'static` — várias
@@ -161,11 +165,13 @@ identidade da planta, não da matemática de mistura.
 */
 pub type Species<const N: usize> = [&'static str; N];
 
-/** Composição/inventário de N espécies químicas — o `[f64; N]` que descreve uma corrente, um vaso,
+/** Quanto existe de cada uma de N substâncias — o `[f64; N]` que descreve uma corrente, um vaso,
 um estado, deixa de ser um array cru repetido em cada unidade e vira um tipo com identidade própria:
-sabe seu total, sua fase, o nome de cada componente, e as operações que já se repetiam por toda
-parte (soma, normalização, produto escalar, pressão parcial) como método nomeado, não `for i in
-0..N` reescrito a cada chamada.
+sabe seu total, o nome de cada componente, e as operações que já se repetiam por toda parte (soma,
+normalização, produto escalar, pressão parcial) como método nomeado, não `for i in 0..N` reescrito
+a cada chamada. Serve tanto pra quantidades (moles) quanto pra frações, taxas ou vazões por
+componente: o tipo não impõe soma 1 nem diz se é vapor ou líquido — quem dá esse significado é o nome
+da variável de quem usa.
 
 Filosofia: a maioria das `Mixture` do sistema nasce de OUTRA `Mixture` já existente — soma (`+`),
 subtração (`-`), escala (`scaled_by`), normalização (`mole_fractions`) — nunca de um array digitado
@@ -176,7 +182,6 @@ já existem deveria raramente precisar delas.
 #[derive(Clone, Copy, Debug)]
 pub struct Mixture<const N: usize> {
     values: [f64; N],
-    phase: Phase,
     species: &'static Species<N>,
 }
 
@@ -184,12 +189,12 @@ impl<const N: usize> Mixture<N> {
     /** Todas as N posições em zero — pra quando o valor inicial é "nada aqui ainda", sem o chamador
     precisar escrever `[0.0; N]` toda vez.
     */
-    pub fn zero(phase: Phase, species: &'static Species<N>) -> Self {
-        Self { values: [0.0; N], phase, species }
+    pub fn zero(species: &'static Species<N>) -> Self {
+        Self { values: [0.0; N], species }
     }
 
-    pub fn new(values: [f64; N], phase: Phase, species: &'static Species<N>) -> Self {
-        Self { values, phase, species }
+    pub fn new(values: [f64; N], species: &'static Species<N>) -> Self {
+        Self { values, species }
     }
 
     /** Constrói a partir de um array MENOR (M componentes), colocado a partir de `offset`, com o
@@ -197,22 +202,28 @@ impl<const N: usize> Mixture<N> {
     vapor do reator só tem A/B/C, mora nas 3 primeiras posições de um total de 8; sem isto, quem
     chama precisaria escrever `std::array::from_fn` + `if` toda vez que isso acontece).
     */
-    pub fn at<const M: usize>(offset: usize, values: &[f64; M], phase: Phase, species: &'static Species<N>) -> Self {
+    pub fn at<const M: usize>(offset: usize, values: &[f64; M], species: &'static Species<N>) -> Self {
         let mut full = [0.0; N];
         full[offset..offset + M].copy_from_slice(values);
-        Self { values: full, phase, species }
+        Self { values: full, species }
     }
 
     pub fn component(&self, i: usize) -> f64 {
         self.values[i]
     }
 
-    pub fn name(&self, i: usize) -> &'static str {
-        self.species[i]
+    /** O valor de uma espécie pelo NOME (`mixture.get("A")`), em vez de pelo índice. Entra em
+    pânico se o nome não está no catálogo — um erro de digitação, não um caso a tratar.
+    */
+    pub fn get(&self, name: &str) -> f64 {
+        match self.species.iter().position(|candidate| *candidate == name) {
+            Some(i) => self.values[i],
+            None => panic!("espécie `{name}` não está no catálogo {:?}", self.species),
+        }
     }
 
-    pub fn phase(&self) -> Phase {
-        self.phase
+    pub fn name(&self, i: usize) -> &'static str {
+        self.species[i]
     }
 
     pub fn as_array(&self) -> [f64; N] {
@@ -226,11 +237,11 @@ impl<const N: usize> Mixture<N> {
     /** Moles (ou o que quer que `self` represente) → fração do próprio total. */
     pub fn mole_fractions(&self) -> Self {
         let total = self.total();
-        Self { values: std::array::from_fn(|i| self.values[i] / total), phase: self.phase, species: self.species }
+        Self { values: std::array::from_fn(|i| self.values[i] / total), species: self.species }
     }
 
     pub fn scaled_by(&self, factor: f64) -> Self {
-        Self { values: std::array::from_fn(|i| self.values[i] * factor), phase: self.phase, species: self.species }
+        Self { values: std::array::from_fn(|i| self.values[i] * factor), species: self.species }
     }
 
     /** Produto escalar componente-a-componente com um array externo (ex.: composição · peso
@@ -240,20 +251,20 @@ impl<const N: usize> Mixture<N> {
         (0..N).map(|i| self.values[i] * other[i]).sum()
     }
 
-    /** Quanto o total DESTA mistura representa do total de OUTRA que a contém — ex.: a fase vapor
+    /** Quanto o total DESTA mistura representa do total de OUTRA que a contém — ex.: a parte vapor
     de um vaso sobre o inventário total do mesmo vaso.
     */
     pub fn fraction_of(&self, whole: &Self) -> f64 {
         self.total() / whole.total()
     }
 
-    /** Pressão parcial de gás ideal (P_i = n_i·R·T/V) — só fisicamente correto pra componentes que
-    `self` representa como moles de vapor genuíno (não como fração molar de uma fase líquida).
+    /** Pressão parcial de gás ideal (P_i = n_i·R·T/V, com `GAS_CONSTANT`) — só fisicamente correto
+    pra componentes que `self` representa como moles de vapor genuíno (não como fração molar de
+    uma fase líquida).
     */
-    pub fn ideal_gas_pressure(&self, temperature_k: f64, volume: f64, gas_constant: f64) -> Self {
+    pub fn ideal_gas_pressure(&self, temperature_k: f64, volume: f64) -> Self {
         Self {
-            values: std::array::from_fn(|i| self.values[i] * gas_constant * temperature_k / volume),
-            phase: self.phase,
+            values: std::array::from_fn(|i| self.values[i] * GAS_CONSTANT * temperature_k / volume),
             species: self.species,
         }
     }
@@ -268,7 +279,6 @@ impl<const N: usize> Mixture<N> {
             values: std::array::from_fn(|i| {
                 (constants.avp[i] + constants.bvp[i] / (temperature + constants.cvp[i])).exp() * self.values[i]
             }),
-            phase: self.phase,
             species: self.species,
         }
     }
@@ -281,74 +291,113 @@ impl<const N: usize> Mixture<N> {
     }
 }
 
-/** Soma componente-a-componente. Fase resultante: preserva a fase quando as duas são iguais,
-degrada pra `Phase::Mixed` quando somam fases diferentes (ex.: vapor + líquido = inventário total
-de um vaso, que genuinamente tem as duas fases ao mesmo tempo).
-*/
+/** Soma componente-a-componente. */
 impl<const N: usize> std::ops::Add for Mixture<N> {
     type Output = Self;
     fn add(self, other: Self) -> Self {
-        let phase = if self.phase == other.phase { self.phase } else { Phase::Mixed };
-        Self { values: std::array::from_fn(|i| self.values[i] + other.values[i]), phase, species: self.species }
+        Self { values: std::array::from_fn(|i| self.values[i] + other.values[i]), species: self.species }
     }
 }
 
-/** Subtração componente-a-componente — preserva a fase de `self` (ex.: "o que sai desta fase",
-não uma combinação de fases diferentes).
-*/
+/** Subtração componente-a-componente. */
 impl<const N: usize> std::ops::Sub for Mixture<N> {
     type Output = Self;
     fn sub(self, other: Self) -> Self {
-        Self { values: std::array::from_fn(|i| self.values[i] - other.values[i]), phase: self.phase, species: self.species }
+        Self { values: std::array::from_fn(|i| self.values[i] - other.values[i]), species: self.species }
     }
 }
 
-/** Rede de reações de uma planta — estequiometria e calor de cada uma de R reações sobre N espécies.
-Dado da PLANTA (os números), mesmo padrão de `Coefficients<N>`: este módulo só conhece a forma, quem
-monta a planta (ex.: `tep-plant`) fornece os valores.
+/** Uma reação dentro de `Reactions`: a receita (quanto de cada espécie é gasto ou produzido), o calor
+que libera e a fórmula que diz quão rápido ela anda dadas a temperatura e as pressões parciais.
 */
-pub struct ReactionScheme<const N: usize, const R: usize> {
-    /** `stoichiometry[r][i]`: kmol da espécie `i` produzidos (+) ou consumidos (−) por kmol de avanço
-    da reação `r`.
-    */
-    pub stoichiometry: [[f64; N]; R],
-
-    /** Calor liberado por kmol de avanço da reação `r`. */
-    pub enthalpies: [f64; R],
+struct ReactionDefinition<const N: usize> {
+    stoichiometry: [f64; N],
+    heat: f64,
+    rate: Box<dyn Fn(f64, &Mixture<N>) -> f64 + Send + Sync>,
 }
 
-/** Taxa de avanço de cada uma das R reações de um `ReactionScheme<N, R>` — o que a cinética calcula
-(taxas brutas por reação) e o que o resto do sistema realmente consome (consumo/produção líquida por
-espécie e calor total), sem cada unidade reimplementar a estequiometria com `for`/índice à mão.
+/** As reações químicas de uma planta, montadas uma a uma pelo NOME das espécies, sem tabela de
+índices:
 
-Diferente de `Mixture`, não tem fase: uma taxa é uma propriedade da reação, não de um vapor ou
-líquido.
+```ignore
+let reactions = Reactions::new(&SPECIES)
+    .add("A + C + D -> G", 0.0689, |temperature_k, p| arrhenius(31.6, 40000.0, temperature_k) * p.get("A") * p.get("C") * p.get("D"))
+    .add("1.5 D -> F", 0.0, |temperature_k, p| ...);
+```
+
+Cada reação carrega a própria receita, o próprio calor e a própria fórmula de velocidade, então nada
+mais precisa saber "a reação 3 é o índice 2". Depois de montada, `at()` responde, pra um estado, quanto
+de cada substância está sendo consumido ou produzido e quanto calor está sendo liberado.
 */
-#[derive(Clone, Copy)]
-pub struct Reaction<const N: usize, const R: usize> {
-    rates: [f64; R],
-    scheme: &'static ReactionScheme<N, R>,
+pub struct Reactions<const N: usize> {
+    species: &'static Species<N>,
+    reactions: Vec<ReactionDefinition<N>>,
 }
 
-impl<const N: usize, const R: usize> Reaction<N, R> {
-    pub fn new(rates: [f64; R], scheme: &'static ReactionScheme<N, R>) -> Self {
-        Self { rates, scheme }
+/** O efeito conjunto de todas as reações de um `Reactions` num dado estado: consumo (−) ou produção
+(+) líquida de cada espécie, somando todas as reações, e o calor total liberado.
+*/
+pub struct ReactionOutcome<const N: usize> {
+    pub species_rates: Mixture<N>,
+    pub heat: f64,
+}
+
+impl<const N: usize> Reactions<N> {
+    pub fn new(species: &'static Species<N>) -> Self {
+        Self { species, reactions: Vec::new() }
     }
 
-    pub fn rate(&self, r: usize) -> f64 {
-        self.rates[r]
-    }
-
-    /** Consumo (−) ou produção (+) líquida de cada espécie, somando a contribuição de todas as
-    reações.
+    /** Acrescenta uma reação. `equation` é a receita escrita com os nomes das espécies, ex.: `"A + C +
+    D -> G"` ou `"1.5 D -> F"` (o número antes do nome é a quantidade; sem número, 1). `heat` é o
+    calor liberado por unidade da reação. `rate` recebe a temperatura em K e as pressões parciais e
+    devolve a velocidade POR UNIDADE DE VOLUME — `at()` multiplica pelo volume.
     */
-    pub fn species_rates(&self) -> [f64; N] {
-        std::array::from_fn(|i| (0..R).map(|r| self.scheme.stoichiometry[r][i] * self.rates[r]).sum())
+    pub fn add(
+        mut self,
+        equation: &str,
+        heat: f64,
+        rate: impl Fn(f64, &Mixture<N>) -> f64 + Send + Sync + 'static,
+    ) -> Self {
+        let stoichiometry = self.parse(equation);
+        self.reactions.push(ReactionDefinition { stoichiometry, heat, rate: Box::new(rate) });
+        self
     }
 
-    /** Calor total liberado por todas as reações. */
-    pub fn heat(&self) -> f64 {
-        (0..R).map(|r| self.scheme.enthalpies[r] * self.rates[r]).sum()
+    fn parse(&self, equation: &str) -> [f64; N] {
+        let (reactants, products) = equation
+            .split_once("->")
+            .unwrap_or_else(|| panic!("reação `{equation}` sem `->` separando reagentes de produtos"));
+
+        let mut stoichiometry = [0.0; N];
+        for (side, sign) in [(reactants, -1.0), (products, 1.0)] {
+            for term in side.split('+') {
+                let term = term.trim();
+                let (amount, name) = match term.split_once(char::is_whitespace) {
+                    Some((first, rest)) if first.parse::<f64>().is_ok() => (first.parse::<f64>().unwrap(), rest.trim()),
+                    _ => (1.0, term),
+                };
+                let index = self.species.iter().position(|candidate| *candidate == name).unwrap_or_else(|| {
+                    panic!("espécie `{name}` da reação `{equation}` não está no catálogo {:?}", self.species)
+                });
+                stoichiometry[index] += sign * amount;
+            }
+        }
+        stoichiometry
+    }
+
+    /** O efeito de todas as reações na temperatura `temperature_k` (K) e nas pressões parciais
+    `partial_pressures`, num vaso com `volume` de gás.
+    */
+    pub fn at(&self, temperature_k: f64, partial_pressures: &Mixture<N>, volume: f64) -> ReactionOutcome<N> {
+        let rates: Vec<f64> =
+            self.reactions.iter().map(|reaction| (reaction.rate)(temperature_k, partial_pressures) * volume).collect();
+
+        let species_rates = std::array::from_fn(|i| {
+            self.reactions.iter().zip(&rates).map(|(reaction, rate)| reaction.stoichiometry[i] * rate).sum()
+        });
+        let heat = self.reactions.iter().zip(&rates).map(|(reaction, rate)| reaction.heat * rate).sum();
+
+        ReactionOutcome { species_rates: Mixture::new(species_rates, self.species), heat }
     }
 }
 
@@ -411,100 +460,101 @@ mod tests {
         assert_eq!(liquid_density(&x, 42.0, &constants), 1.0);
     }
 
+    #[test]
+    fn arrhenius_matches_the_closed_form() {
+        // exp(2.0 - 1.987 / 1.987 / 1.0) = exp(1.0)
+        assert_eq!(arrhenius(2.0, 1.987, 1.0), (2.0f64 - 1.987 / 1.987 / 1.0).exp());
+    }
+
     const TEST_SPECIES: Species<3> = ["X", "Y", "Z"];
 
     #[test]
     fn zero_is_all_zero_without_the_caller_writing_it() {
-        let m = Mixture::zero(Phase::Vapor, &TEST_SPECIES);
+        let m = Mixture::zero(&TEST_SPECIES);
         assert_eq!(m.as_array(), [0.0, 0.0, 0.0]);
-        assert_eq!(m.phase(), Phase::Vapor);
         assert_eq!(m.name(1), "Y");
     }
 
     #[test]
     fn at_places_a_smaller_array_at_an_offset_and_zero_pads_the_rest() {
-        let m: Mixture<5> = Mixture::at(2, &[7.0, 8.0], Phase::Liquid, &["a", "b", "c", "d", "e"]);
+        let m: Mixture<5> = Mixture::at(2, &[7.0, 8.0], &["a", "b", "c", "d", "e"]);
         assert_eq!(m.as_array(), [0.0, 0.0, 7.0, 8.0, 0.0]);
     }
 
     #[test]
+    fn get_reads_a_component_by_species_name() {
+        let m = Mixture::new([1.0, 2.0, 3.0], &TEST_SPECIES);
+        assert_eq!(m.get("Y"), 2.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "não está no catálogo")]
+    fn get_panics_on_an_unknown_species_name() {
+        Mixture::new([1.0, 2.0, 3.0], &TEST_SPECIES).get("Q");
+    }
+
+    #[test]
     fn total_sums_every_component() {
-        let m = Mixture::new([1.0, 2.0, 3.0], Phase::Liquid, &TEST_SPECIES);
+        let m = Mixture::new([1.0, 2.0, 3.0], &TEST_SPECIES);
         assert_eq!(m.total(), 6.0);
     }
 
     #[test]
-    fn mole_fractions_normalizes_by_the_own_total_and_keeps_the_phase() {
-        let m = Mixture::new([1.0, 1.0, 2.0], Phase::Liquid, &TEST_SPECIES);
-        let fractions = m.mole_fractions();
-        assert_eq!(fractions.as_array(), [0.25, 0.25, 0.5]);
-        assert_eq!(fractions.phase(), Phase::Liquid);
+    fn mole_fractions_normalizes_by_the_own_total() {
+        let m = Mixture::new([1.0, 1.0, 2.0], &TEST_SPECIES);
+        assert_eq!(m.mole_fractions().as_array(), [0.25, 0.25, 0.5]);
     }
 
     #[test]
     fn scaled_by_multiplies_every_component() {
-        let m = Mixture::new([1.0, 2.0, 3.0], Phase::Vapor, &TEST_SPECIES);
+        let m = Mixture::new([1.0, 2.0, 3.0], &TEST_SPECIES);
         assert_eq!(m.scaled_by(10.0).as_array(), [10.0, 20.0, 30.0]);
     }
 
     #[test]
     fn dot_is_the_componentwise_scalar_product() {
-        let m = Mixture::new([1.0, 2.0, 3.0], Phase::Vapor, &TEST_SPECIES);
+        let m = Mixture::new([1.0, 2.0, 3.0], &TEST_SPECIES);
         assert_eq!(m.dot(&[10.0, 10.0, 10.0]), 60.0);
     }
 
     #[test]
     fn fraction_of_divides_totals() {
-        let part = Mixture::new([1.0, 1.0, 0.0], Phase::Vapor, &TEST_SPECIES);
-        let whole = Mixture::new([2.0, 2.0, 4.0], Phase::Mixed, &TEST_SPECIES);
+        let part = Mixture::new([1.0, 1.0, 0.0], &TEST_SPECIES);
+        let whole = Mixture::new([2.0, 2.0, 4.0], &TEST_SPECIES);
         assert_eq!(part.fraction_of(&whole), 2.0 / 8.0);
     }
 
     #[test]
-    fn add_preserves_phase_when_both_sides_match_but_degrades_to_mixed_otherwise() {
-        let vapor_a = Mixture::new([1.0, 0.0, 0.0], Phase::Vapor, &TEST_SPECIES);
-        let vapor_b = Mixture::new([0.0, 1.0, 0.0], Phase::Vapor, &TEST_SPECIES);
-        assert_eq!((vapor_a + vapor_b).phase(), Phase::Vapor);
-        assert_eq!((vapor_a + vapor_b).as_array(), [1.0, 1.0, 0.0]);
-
-        let liquid = Mixture::new([0.0, 0.0, 1.0], Phase::Liquid, &TEST_SPECIES);
-        assert_eq!((vapor_a + liquid).phase(), Phase::Mixed);
-        assert_eq!((vapor_a + liquid).as_array(), [1.0, 0.0, 1.0]);
+    fn add_and_sub_work_component_by_component() {
+        let a = Mixture::new([1.0, 0.0, 0.0], &TEST_SPECIES);
+        let b = Mixture::new([0.0, 1.0, 0.0], &TEST_SPECIES);
+        assert_eq!((a + b).as_array(), [1.0, 1.0, 0.0]);
+        assert_eq!((a - b).as_array(), [1.0, -1.0, 0.0]);
     }
 
-    /** Prova que `Add` sozinho já cobre o caso que motivou um `splice`/merge por faixa de índice
-    num rascunho anterior (ver tep-plant/docs/streams-spring-style): duas Mixture, cada uma válida
-    só numa faixa de índices e ZERO na outra (por construção — `zero()` + preencher só a parte que
-    faz sentido), somadas dão exatamente a combinação esperada, sem precisar de um método à parte.
+    /** `Add` sozinho já cobre o caso de juntar duas Mixture, cada uma válida só numa faixa de
+    índices e ZERO na outra (por construção — `zero()` + preencher só a parte que faz sentido),
+    sem precisar de um método de "splice" por faixa de índice.
     */
     #[test]
-    fn add_combines_two_zero_padded_range_specific_mixtures_without_needing_a_splice_method() {
-        let gas_partial = Mixture::new([5.0, 0.0, 0.0], Phase::Vapor, &TEST_SPECIES); // válido só no índice 0
-        let liquid_partial = Mixture::new([0.0, 0.0, 9.0], Phase::Liquid, &TEST_SPECIES); // válido só no índice 2
+    fn add_combines_two_zero_padded_range_specific_mixtures() {
+        let gas_partial = Mixture::new([5.0, 0.0, 0.0], &TEST_SPECIES); // válido só no índice 0
+        let liquid_partial = Mixture::new([0.0, 0.0, 9.0], &TEST_SPECIES); // válido só no índice 2
         assert_eq!((gas_partial + liquid_partial).as_array(), [5.0, 0.0, 9.0]);
     }
 
     #[test]
-    fn sub_preserves_the_phase_of_self() {
-        let inflow = Mixture::new([5.0, 5.0, 5.0], Phase::Vapor, &TEST_SPECIES);
-        let outflow = Mixture::new([1.0, 2.0, 3.0], Phase::Liquid, &TEST_SPECIES);
-        let result = inflow - outflow;
-        assert_eq!(result.as_array(), [4.0, 3.0, 2.0]);
-        assert_eq!(result.phase(), Phase::Vapor);
-    }
-
-    #[test]
-    fn ideal_gas_pressure_matches_pv_nrt() {
-        let m = Mixture::new([2.0, 0.0, 0.0], Phase::Vapor, &TEST_SPECIES);
-        // P = n*R*T/V = 2.0 * 10.0 * 300.0 / 100.0 = 60.0
-        assert_eq!(m.ideal_gas_pressure(300.0, 100.0, 10.0).component(0), 60.0);
+    fn ideal_gas_pressure_matches_pv_nrt_with_the_framework_gas_constant() {
+        let m = Mixture::new([2.0, 0.0, 0.0], &TEST_SPECIES);
+        // P = n*R*T/V = 2.0 * GAS_CONSTANT * 300.0 / 100.0
+        assert_eq!(m.ideal_gas_pressure(300.0, 100.0).component(0), 2.0 * GAS_CONSTANT * 300.0 / 100.0);
     }
 
     #[test]
     fn vapor_pressure_matches_antoine_times_mole_fraction() {
         const SPECIES: Species<1> = ["X"];
         let constants = single_component_coefficients();
-        let m = Mixture::new([0.5], Phase::Liquid, &SPECIES);
+        let m = Mixture::new([0.5], &SPECIES);
         // avp=bvp=cvp=0 -> exp(0) = 1.0 -> resultado = 1.0 * fração = 0.5
         assert_eq!(m.vapor_pressure(42.0, &constants).component(0), 0.5);
     }
@@ -513,32 +563,48 @@ mod tests {
     fn mixture_enthalpy_method_matches_the_free_function() {
         const SPECIES: Species<1> = ["X"];
         let constants = single_component_coefficients();
-        let m = Mixture::new([1.0], Phase::Liquid, &SPECIES);
+        let m = Mixture::new([1.0], &SPECIES);
         assert_eq!(m.enthalpy(100.0, 0, &constants), mixture_enthalpy(&[1.0], 100.0, 0, &constants));
     }
 
-    /* Rede de duas reações sobre 3 espécies (X, Y, Z): X + Y → Z (calor 5.0) e 2 Z → 3 X (calor 0.0) */
-    const TEST_SCHEME: ReactionScheme<3, 2> =
-        ReactionScheme { stoichiometry: [[-1.0, -1.0, 1.0], [3.0, 0.0, -2.0]], enthalpies: [5.0, 0.0] };
+    /* Duas reações sobre 3 espécies (X, Y, Z): X + Y → Z (calor 5.0, velocidade fixa 2.0 por volume)
+    e 2 Z → 3 X (calor 0.0, velocidade fixa 1.0 por volume).
+    */
+    fn test_reactions() -> Reactions<3> {
+        Reactions::new(&TEST_SPECIES).add("X + Y -> Z", 5.0, |_, _| 2.0).add("2 Z -> 3 X", 0.0, |_, _| 1.0)
+    }
 
     #[test]
-    fn reaction_species_rates_sum_the_stoichiometry_of_every_reaction() {
-        let reaction = Reaction::new([2.0, 1.0], &TEST_SCHEME);
+    fn reactions_species_rates_sum_the_stoichiometry_of_every_reaction() {
+        let outcome = test_reactions().at(300.0, &Mixture::zero(&TEST_SPECIES), 1.0);
         // X: -1*2 + 3*1 = 1.0 | Y: -1*2 + 0*1 = -2.0 | Z: 1*2 + -2*1 = 0.0
-        assert_eq!(reaction.species_rates(), [1.0, -2.0, 0.0]);
+        assert_eq!(outcome.species_rates.as_array(), [1.0, -2.0, 0.0]);
     }
 
     #[test]
-    fn reaction_heat_sums_enthalpy_times_rate_of_every_reaction() {
-        let reaction = Reaction::new([2.0, 1.0], &TEST_SCHEME);
-        assert_eq!(reaction.heat(), 10.0);
+    fn reactions_heat_sums_heat_times_rate_of_every_reaction() {
+        let outcome = test_reactions().at(300.0, &Mixture::zero(&TEST_SPECIES), 1.0);
+        assert_eq!(outcome.heat, 10.0);
     }
 
     #[test]
-    fn reaction_with_all_rates_at_zero_consumes_and_releases_nothing() {
-        let reaction = Reaction::new([0.0, 0.0], &TEST_SCHEME);
-        assert_eq!(reaction.species_rates(), [0.0, 0.0, 0.0]);
-        assert_eq!(reaction.heat(), 0.0);
-        assert_eq!(reaction.rate(1), 0.0);
+    fn reactions_scale_the_per_volume_rate_by_the_volume() {
+        let outcome = test_reactions().at(300.0, &Mixture::zero(&TEST_SPECIES), 10.0);
+        assert_eq!(outcome.heat, 100.0);
+        assert_eq!(outcome.species_rates.as_array(), [10.0, -20.0, 0.0]);
+    }
+
+    #[test]
+    fn reactions_hand_the_temperature_and_partial_pressures_to_the_rate_formula() {
+        let reactions = Reactions::new(&TEST_SPECIES).add("X -> Y", 0.0, |temperature_k, p| temperature_k * p.get("X"));
+        let outcome = reactions.at(10.0, &Mixture::new([3.0, 0.0, 0.0], &TEST_SPECIES), 1.0);
+        // velocidade = 10 * 3 = 30: X perde 30, Y ganha 30
+        assert_eq!(outcome.species_rates.as_array(), [-30.0, 30.0, 0.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "não está no catálogo")]
+    fn reactions_panic_on_an_unknown_species_in_the_equation() {
+        Reactions::new(&TEST_SPECIES).add("X + Q -> Z", 0.0, |_, _| 1.0);
     }
 }

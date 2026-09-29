@@ -154,15 +154,15 @@ fn parse_task_args(attr: TokenStream) -> syn::Result<TaskArgs> {
 
 /** Um sinal usado no corpo de um `#[task]`: `need::a__b` (lido) ou `offer::a__b = valor` (escrito).
 O nome do identificador É a chave, com `__` virando `.` (`reactor__temperature` →
-`"reactor.temperature"`). Com `::<Vapor>`/`::<Liquid>`/`::<Mixed>` no fim (`need::a__b::<Vapor>`), o
+`"reactor.temperature"`). Com `::<Mixture>` no fim (`need::a__b::<Mixture>`), o
 sinal é uma MISTURA: uma `Mixture` de `len` componentes, publicada como `len` chaves (`a.b.a`,
 `a.b.b`, ...) e lida/escrita como um valor só — ninguém escreve array nenhum.
 */
 struct SigUse {
     field: syn::Ident,
     keys: Vec<String>,
-    /* `None` = escalar; `Some(fase)` = mistura (nome da variante de `Phase`). */
-    phase: Option<String>,
+    /* `false` = escalar; `true` = mistura (`::<Mixture>`). */
+    is_mixture: bool,
 }
 
 struct SignalRewriter<'a> {
@@ -172,7 +172,7 @@ struct SignalRewriter<'a> {
     error: Option<syn::Error>,
 }
 
-/* `need::nome` / `offer::nome` (opcionalmente `::<Fase>` no último segmento) → (é_offer, nome, fase). */
+/* `need::nome` / `offer::nome` (opcionalmente `::<Mixture>` no último segmento) → (é_offer, nome, tipo). */
 fn sig_path(expr: &syn::Expr) -> Option<(bool, syn::Ident, Option<syn::Ident>)> {
     let syn::Expr::Path(path_expr) = expr else { return None };
     if path_expr.qself.is_some() || path_expr.path.leading_colon.is_some() || path_expr.path.segments.len() != 2 {
@@ -225,15 +225,14 @@ impl SignalRewriter<'_> {
     /* Registra (ou reencontra) um sinal; devolve `None` (e guarda o erro) se algo não bate. */
     fn register(&mut self, is_offer: bool, name: &syn::Ident, phase: Option<&syn::Ident>) -> Option<usize> {
         let span = name.span();
-        let phase_name = match phase {
-            None => None,
+        let is_mixture = match phase {
+            None => false,
             Some(ident) => {
-                let text = ident.to_string();
-                if !matches!(text.as_str(), "Vapor" | "Liquid" | "Mixed") {
-                    self.fail(ident.span(), "a fase de um sinal-mistura precisa ser `Vapor`, `Liquid` ou `Mixed`");
+                if ident != "Mixture" {
+                    self.fail(ident.span(), "o único tipo aceito depois de `::<>` é `Mixture`");
                     return None;
                 }
-                Some(text)
+                true
             }
         };
 
@@ -251,31 +250,30 @@ impl SignalRewriter<'_> {
 
         let list = if is_offer { &self.offers } else { &self.needs };
         if let Some(position) = list.iter().position(|(existing, _)| existing == name) {
-            if list[position].1.phase != phase_name {
-                self.fail(span, &format!("`{name}` é usado ora como escalar, ora como mistura, ou com fases diferentes"));
+            if list[position].1.is_mixture != is_mixture {
+                self.fail(span, &format!("`{name}` é usado ora como escalar, ora como mistura"));
                 return None;
             }
             return Some(position);
         }
 
         let base_key = name.to_string().replace("__", ".");
-        let keys = match &phase_name {
-            None => vec![base_key],
-            Some(_) => {
-                let (Some(len), Some(_)) = (self.args.len, &self.args.species) else {
-                    self.fail(
-                        span,
-                        "sinal-mistura precisa de `#[monjolo::tasks(species = CAMINHO, len = N)]` no `impl`",
-                    );
-                    return None;
-                };
-                (0..len).map(|i| format!("{base_key}.{}", (b'a' + i as u8) as char)).collect()
-            }
+        let keys = if is_mixture {
+            let (Some(len), Some(_)) = (self.args.len, &self.args.species) else {
+                self.fail(
+                    span,
+                    "sinal-mistura precisa de `#[monjolo::tasks(species = CAMINHO, len = N)]` no `impl`",
+                );
+                return None;
+            };
+            (0..len).map(|i| format!("{base_key}.{}", (b'a' + i as u8) as char)).collect()
+        } else {
+            vec![base_key]
         };
 
         let prefix = if is_offer { "__offer_" } else { "__need_" };
         let field = format_ident!("{}{}", prefix, name);
-        let entry = (name.clone(), SigUse { field, keys, phase: phase_name });
+        let entry = (name.clone(), SigUse { field, keys, is_mixture });
         let list = if is_offer { &mut self.offers } else { &mut self.needs };
         list.push(entry);
         Some(list.len() - 1)
@@ -283,36 +281,32 @@ impl SignalRewriter<'_> {
 
     fn read_expr(&self, sig: &SigUse) -> syn::Expr {
         let field = &sig.field;
-        match &sig.phase {
-            None => syn::parse_quote!(__sig.#field.get()),
-            Some(phase) => {
-                let phase = format_ident!("{}", phase);
-                let len = self.args.len.expect("checado em register()");
-                let species = self.args.species.as_ref().expect("checado em register()");
-                syn::parse_quote!(
-                    ::monjolo::chemistry::Mixture::<#len>::new(
-                        ::std::array::from_fn(|__i| __sig.#field[__i].get()),
-                        ::monjolo::chemistry::Phase::#phase,
-                        &#species,
-                    )
+        if !sig.is_mixture {
+            syn::parse_quote!(__sig.#field.get())
+        } else {
+            let len = self.args.len.expect("checado em register()");
+            let species = self.args.species.as_ref().expect("checado em register()");
+            syn::parse_quote!(
+                ::monjolo::chemistry::Mixture::<#len>::new(
+                    ::std::array::from_fn(|__i| __sig.#field[__i].get()),
+                    &#species,
                 )
-            }
+            )
         }
     }
 
     fn write_expr(&self, sig: &SigUse, value: &syn::Expr) -> syn::Expr {
         let field = &sig.field;
-        match &sig.phase {
-            None => syn::parse_quote!(__sig.#field.set(#value)),
-            Some(_) => {
-                let len = self.args.len.expect("checado em register()");
-                syn::parse_quote!({
-                    let __mixture = #value;
-                    for __i in 0..#len {
-                        __sig.#field[__i].set(__mixture.component(__i));
-                    }
-                })
-            }
+        if !sig.is_mixture {
+            syn::parse_quote!(__sig.#field.set(#value))
+        } else {
+            let len = self.args.len.expect("checado em register()");
+            syn::parse_quote!({
+                let __mixture = #value;
+                for __i in 0..#len {
+                    __sig.#field[__i].set(__mixture.component(__i));
+                }
+            })
         }
     }
 }
@@ -430,16 +424,13 @@ fn build_signal_task(
             let start = keys.len();
             keys.extend(sig.keys.iter().cloned());
             let field = &sig.field;
-            match &sig.phase {
-                None => {
-                    proxy_fields.push(quote! { #field: ::monjolo::state_registry::Proxy });
-                    field_inits.push(field_init_from_slice(field, source, start, 1, None));
-                }
-                Some(_) => {
-                    let len = sig.keys.len();
-                    proxy_fields.push(quote! { #field: [::monjolo::state_registry::Proxy; #len] });
-                    field_inits.push(field_init_from_slice(field, source, start, len, Some(len)));
-                }
+            if !sig.is_mixture {
+                proxy_fields.push(quote! { #field: ::monjolo::state_registry::Proxy });
+                field_inits.push(field_init_from_slice(field, source, start, 1, None));
+            } else {
+                let len = sig.keys.len();
+                proxy_fields.push(quote! { #field: [::monjolo::state_registry::Proxy; #len] });
+                field_inits.push(field_init_from_slice(field, source, start, len, Some(len)));
             }
         }
     }
