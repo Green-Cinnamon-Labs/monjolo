@@ -235,8 +235,15 @@ impl<const N: usize> Mixture<N> {
     }
 
     /** Moles (ou o que quer que `self` represente) → fração do próprio total. */
+    /** Moles (ou o que `self` representa) → fração do próprio total. Total zero devolve tudo zero
+    (não NaN) — "nada aqui, então nada é fração de nada" é uma resposta válida, diferente de
+    "divisão inválida".
+    */
     pub fn mole_fractions(&self) -> Self {
         let total = self.total();
+        if total == 0.0 {
+            return Self::zero(self.species);
+        }
         Self { values: std::array::from_fn(|i| self.values[i] / total), species: self.species }
     }
 
@@ -304,6 +311,17 @@ impl<const N: usize> std::ops::Sub for Mixture<N> {
     type Output = Self;
     fn sub(self, other: Self) -> Self {
         Self { values: std::array::from_fn(|i| self.values[i] - other.values[i]), species: self.species }
+    }
+}
+
+/** Multiplicação componente-a-componente (produto de Hadamard) — cada posição multiplica só pela
+mesma posição da outra `Mixture`, sem somar nada no final (diferente de `dot`, que soma tudo num
+único número). Pra multiplicar TODAS as posições pelo MESMO fator, use `scaled_by`, não isto.
+*/
+impl<const N: usize> std::ops::Mul for Mixture<N> {
+    type Output = Self;
+    fn mul(self, other: Self) -> Self {
+        Self { values: std::array::from_fn(|i| self.values[i] * other.values[i]), species: self.species }
     }
 }
 
@@ -506,6 +524,12 @@ mod tests {
     }
 
     #[test]
+    fn mole_fractions_of_a_zero_total_is_zero_not_nan() {
+        let m = Mixture::zero(&TEST_SPECIES);
+        assert_eq!(m.mole_fractions().as_array(), [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn scaled_by_multiplies_every_component() {
         let m = Mixture::new([1.0, 2.0, 3.0], &TEST_SPECIES);
         assert_eq!(m.scaled_by(10.0).as_array(), [10.0, 20.0, 30.0]);
@@ -530,6 +554,13 @@ mod tests {
         let b = Mixture::new([0.0, 1.0, 0.0], &TEST_SPECIES);
         assert_eq!((a + b).as_array(), [1.0, 1.0, 0.0]);
         assert_eq!((a - b).as_array(), [1.0, -1.0, 0.0]);
+    }
+
+    #[test]
+    fn mul_multiplies_component_by_the_same_component_of_the_other_mixture() {
+        let a = Mixture::new([2.0, 3.0, 4.0], &TEST_SPECIES);
+        let b = Mixture::new([5.0, 0.0, 1.0], &TEST_SPECIES);
+        assert_eq!((a * b).as_array(), [10.0, 0.0, 4.0]);
     }
 
     /** `Add` sozinho já cobre o caso de juntar duas Mixture, cada uma válida só numa faixa de
