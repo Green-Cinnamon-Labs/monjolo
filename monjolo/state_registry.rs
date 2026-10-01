@@ -611,6 +611,31 @@ impl StateRegistry {
             }
         }
 
+        /* Duas chaves iguais, de DOIS `#[disturbance]` diferentes, é erro — hoje `Intercept` guarda
+        um `Rc<dyn DisturbanceInterceptor>` só (não uma cadeia), então o segundo registro
+        SOBRESCREVERIA o primeiro silenciosamente no loop abaixo, em vez de combinar os dois
+        efeitos (ex.: IDV(1) e IDV(2) de verdade se somam no `teprob.f`, sobre A/B/C do mesmo
+        stream 4 — StateRegistry ainda não sabe compor isso). Falhar alto e cedo, no bootstrap, é
+        melhor que um dos dois distúrbios simplesmente "sumir" sem aviso.
+        */
+        let mut claimed_by: HashMap<&str, usize> = HashMap::new();
+        for (idx, disturbance) in self.disturbances.iter().enumerate() {
+            for key in &disturbance.keys {
+                match claimed_by.get(key.as_str()) {
+                    Some(&owner) if owner != idx => {
+                        return Err(format!(
+                            "chave '{key}' interceptada por dois #[disturbance] diferentes — \
+                            StateRegistry não combina dois interceptadores pra mesma chave hoje \
+                            (cada chave só pode pertencer a UM grupo registrado por vez)"
+                        ));
+                    }
+                    _ => {
+                        claimed_by.insert(key.as_str(), idx);
+                    }
+                }
+            }
+        }
+
         /* Pra cada distúrbio registrado, marca `Some(Intercept)` em toda `Proxy` PENDENTE (`need::`
         de outro componente) cuja chave pertença a este grupo — `apply()` lê o que precisar sozinho
         (via os próprios Proxy que `interceptor` já guarda, populados em `new()`), então não há
@@ -957,6 +982,37 @@ mod tests {
             raw: raw_needed[0].clone(),
         });
         registry.register_disturbance(&["mix.missing"], interceptor);
+        assert!(registry.resolve().is_err());
+    }
+
+    /* Caso real: IDV(1) e IDV(2) do TEP de verdade se somam sobre A/B/C do mesmo stream — mas
+    `Intercept` guarda um interceptador só, não uma cadeia, então dois `#[disturbance]` disputando
+    a MESMA chave não podem conviver hoje. Fail-fast no bootstrap é melhor que um dos dois sumir
+    silenciosamente (o que `resolve()` fazia antes desta checagem, sobrescrevendo o primeiro).
+    */
+    #[test]
+    fn resolve_errors_when_two_different_disturbances_claim_the_same_key() {
+        let mut registry = StateRegistry::new();
+
+        let (offered, _) = registry.subscribe(&["mix.a"], &[]);
+        offered[0].set(0.5);
+
+        let (active_a, _) = registry.subscribe(&["disturbance.a"], &[]);
+        let (_, raw_a) = registry.subscribe(&[], &["mix.a"]);
+        let interceptor_a: Rc<dyn DisturbanceInterceptor> = Rc::new(AddOneHundred {
+            active: active_a[0].clone(),
+            raw: raw_a[0].clone(),
+        });
+        registry.register_disturbance(&["mix.a"], interceptor_a);
+
+        let (active_b, _) = registry.subscribe(&["disturbance.b"], &[]);
+        let (_, raw_b) = registry.subscribe(&[], &["mix.a"]);
+        let interceptor_b: Rc<dyn DisturbanceInterceptor> = Rc::new(AddOneHundred {
+            active: active_b[0].clone(),
+            raw: raw_b[0].clone(),
+        });
+        registry.register_disturbance(&["mix.a"], interceptor_b);
+
         assert!(registry.resolve().is_err());
     }
 }
