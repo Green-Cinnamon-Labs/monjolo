@@ -52,6 +52,20 @@ pub struct StateSlot {
     pub value: f64,
 }
 
+/** Implementado pelo struct que `#[monjolo::disturbance(...)]` gera (mesma família de
+`#[actuator]`/`#[sensor]`/`#[controller]`: struct com campos escondidos + getters, usuário escreve
+um `impl` à parte com um método convencional — aqui, `disturb(&self)`). `active()` é barato (um
+único `Proxy::get()`) e decide se vale a pena chamar `apply()`; `apply()` computa o grupo INTEIRO
+(na mesma ordem de `keys` passada a `register_disturbance`) lendo o que precisar por conta própria
+(via `Proxy`s que o próprio struct já guarda, resolvidos uma vez em `new()`) — `Proxy::get()`, do
+lado de quem lê, não sabe nada do que tem por trás: nem `Mixture`, nem química, nem de onde vieram
+os valores.
+*/
+pub trait DisturbanceInterceptor {
+    fn active(&self) -> f64;
+    fn apply(&self) -> Vec<f64>;
+}
+
 /** O que um `Proxy` precisa pra responder "este grupo de chaves tem um distúrbio associado, e ele
 está ligado?" sem perguntar nada em runtime além de um `Option` — tudo aqui já foi resolvido uma vez
 por `StateRegistry::resolve()` (Art. "distúrbio por interceptação", ver `register_disturbance`).
@@ -59,15 +73,9 @@ Nenhuma outra `Proxy` do sistema paga custo nenhum por isto existir: só as que 
 com distúrbio registrado ganham `Some(Intercept)`; todas as outras ficam `None` pra sempre.
 */
 struct Intercept {
-    /** Índices já resolvidos de TODO o grupo (não só desta posição) — pra `transform` poder ler
-    os componentes vizinhos (ex.: IDV(1) altera A olhando A e B pra calcular C).
-    */
-    peer_indices: Rc<[usize]>,
-    /** Minha posição dentro do grupo — qual elemento do `Vec` que `transform` devolve é o meu. */
+    /** Minha posição dentro do grupo — qual elemento do `Vec` que `apply()` devolve é o meu. */
     position: usize,
-    /** Liga/desliga do distúrbio — o MESMO `Proxy` que o `Actuator::write()` gerado escreve. */
-    active: Proxy,
-    transform: fn(f64, &[f64]) -> Vec<f64>,
+    interceptor: Rc<dyn DisturbanceInterceptor>,
 }
 
 /** Handle autossuficiente pra uma posição no buffer de avaliação — carrega o buffer compartilhado
@@ -117,11 +125,13 @@ impl Proxy {
         idx
     }
 
-    /** Lê o valor cru desta posição, sem checar distúrbio nenhum — é o que `Intercept::transform`
-    usa pra ler os componentes vizinhos do próprio grupo, pra não reentrar em `get()` (que aplicaria
-    o distúrbio de novo).
+    /** Lê o valor cru desta posição, sem checar distúrbio nenhum — o caminho comum (nenhum
+    `Intercept` registrado) e o fallback quando um está registrado mas desligado. `pub`: quem
+    `#[monjolo::disturbance(...)]` gera usa isto (nunca `get()`) pra ler seus próprios `Proxy` de
+    `intercepts` — eles PEDEM (`need::`) as mesmas chaves que o grupo intercepta, então também
+    ganham `Some(Intercept)` em `resolve()`; ler via `get()` reentraria em `apply()` (recursão).
     */
-    fn get_raw(&self) -> f64 {
+    pub fn get_raw(&self) -> f64 {
         self.buffer.borrow()[self.index()].get()
     }
 
@@ -131,13 +141,10 @@ impl Proxy {
         let Some(intercept) = intercept.as_ref() else {
             return raw;
         };
-        if intercept.active.get_raw() == 0.0 {
+        if intercept.interceptor.active() == 0.0 {
             return raw;
         }
-        let buffer = self.buffer.borrow();
-        let peers: Vec<f64> = intercept.peer_indices.iter().map(|&idx| buffer[idx].get()).collect();
-        drop(buffer);
-        (intercept.transform)(intercept.active.get_raw(), &peers)[intercept.position]
+        intercept.interceptor.apply()[intercept.position]
     }
 
     pub fn set(&self, value: f64) {
@@ -344,17 +351,16 @@ pub struct StateRegistry {
     instance_index: HashMap<String, usize>,
 
     /** Distúrbios registrados por interceptação (ver `register_disturbance`/`Intercept`) — cada
-    entrada é um grupo de chaves + o `Proxy` de liga/desliga + a função de transformação.
-    `resolve()` consulta esta lista UMA vez, no final, pra decidir quais `Proxy` pendentes ganham
-    `Some(Intercept)`; depois disso, nunca mais é consultada por leitura nenhuma.
+    entrada é um grupo de chaves + o interceptador que sabe computá-las. `resolve()` consulta esta
+    lista UMA vez, no final, pra decidir quais `Proxy` pendentes ganham `Some(Intercept)`; depois
+    disso, nunca mais é consultada por leitura nenhuma.
     */
     disturbances: Vec<DisturbanceRegistration>,
 }
 
 struct DisturbanceRegistration {
     keys: Vec<String>,
-    active: Proxy,
-    transform: fn(f64, &[f64]) -> Vec<f64>,
+    interceptor: Rc<dyn DisturbanceInterceptor>,
 }
 
 impl StateRegistry {
@@ -568,20 +574,23 @@ impl StateRegistry {
     }
 
     /** Registra um distúrbio por interceptação: qualquer `need::` pendente pra uma chave deste
-    grupo passa a, quando `active` estiver ligado (!= 0.0), devolver `transform(active, vizinhos)`
-    no lugar do valor cru — sem o componente que OFERECE a chave (ex.: `Feed`) nem o que a PEDE
-    (ex.: `Stripper`) saberem que isto existe. Chamado durante `construct()`, pela tarefa que
-    `#[disturbance(...)]` gera — nunca diretamente por código de planta.
+    grupo passa a, quando `interceptor.active()` estiver ligado (!= 0.0), devolver
+    `interceptor.apply()[posição]` no lugar do valor cru — sem o componente que OFERECE a chave
+    (ex.: `Feed`) nem o que a PEDE (ex.: `Stripper`) saberem que isto existe. Chamado durante
+    `construct()`, pelo struct que `#[monjolo::disturbance(...)]` gera — nunca diretamente por
+    código de planta.
 
-    `keys` precisa estar na MESMA ordem que `transform` espera/devolve (ex.: `["...a","...b",...]`
-    pros 8 componentes de uma `Mixture`, mesma convenção de `need::`/`offer::`). `active` é o
-    `Proxy` interno que o `Actuator::write()` gerado escreve — lido aqui, nunca mutado.
+    `keys` precisa estar na MESMA ordem que `interceptor.apply()` devolve (ex.: `["...a","...b",...]`
+    pros 8 componentes de uma `Mixture`, mesma convenção de `need::`/`offer::`). Nenhuma validação
+    acontece aqui — se nenhum `need::` pedir uma chave deste grupo, o registro fica sem efeito
+    nenhum (não é erro: `interceptor` normalmente é TAMBÉM consumidor dessas mesmas chaves, pra
+    alimentar seus próprios getters, e É essa necessidade própria que `resolve()` cobra um ofertante
+    — ver `#[monjolo::disturbance]`).
     */
-    pub fn register_disturbance(&mut self, keys: &[&str], active: Proxy, transform: fn(f64, &[f64]) -> Vec<f64>) {
+    pub fn register_disturbance(&mut self, keys: &[&str], interceptor: Rc<dyn DisturbanceInterceptor>) {
         self.disturbances.push(DisturbanceRegistration {
             keys: keys.iter().map(|k| k.to_string()).collect(),
-            active,
-            transform,
+            interceptor,
         });
     }
 
@@ -602,33 +611,18 @@ impl StateRegistry {
             }
         }
 
-        /* Pra cada distúrbio registrado, resolve o índice de TODO o grupo (não só o que algum
-        `need::` pediu — `transform` pode precisar de um componente que ninguém além dela lê, ex.:
-        IDV(1) olha B pra calcular C, mesmo que só A e C tenham consumidor) e marca `Some(Intercept)`
-        em toda `Proxy` pendente cuja chave pertença a este grupo.
+        /* Pra cada distúrbio registrado, marca `Some(Intercept)` em toda `Proxy` PENDENTE (`need::`
+        de outro componente) cuja chave pertença a este grupo — `apply()` lê o que precisar sozinho
+        (via os próprios Proxy que `interceptor` já guarda, populados em `new()`), então não há
+        índice nenhum pra resolver aqui além da posição dentro do grupo.
         */
         for disturbance in &self.disturbances {
-            let mut peer_indices = Vec::with_capacity(disturbance.keys.len());
-            for key in &disturbance.keys {
-                match self.index.get(key) {
-                    Some(&idx) => peer_indices.push(idx),
-                    None => {
-                        return Err(format!(
-                            "#[disturbance] registrado pra '{key}' mas nenhum componente oferece esse slot"
-                        ))
-                    }
-                }
-            }
-            let peer_indices: Rc<[usize]> = peer_indices.into();
-
             for (position, key) in disturbance.keys.iter().enumerate() {
                 for (pending_key, proxy) in &self.pending_requests {
                     if pending_key == key {
                         *proxy.intercept.borrow_mut() = Some(Intercept {
-                            peer_indices: peer_indices.clone(),
                             position,
-                            active: disturbance.active.clone(),
-                            transform: disturbance.transform,
+                            interceptor: disturbance.interceptor.clone(),
                         });
                     }
                 }
@@ -846,20 +840,34 @@ mod tests {
         assert!(registry.instance::<DummyActuator>("Reactor").is_none());
     }
 
-    /* `shift_a_into_c`: igual à transformação real do IDV(1) — A cai 0.03, C absorve, B intocado.
-    Testa só o mecanismo de interceptação do StateRegistry, sem passar pela macro #[disturbance].
+    /* ShiftAIntoC: igual à transformação real do IDV(1) — A cai 0.03, C absorve, B intocado. Testa
+    só o mecanismo de interceptação do StateRegistry (Intercept/DisturbanceInterceptor/
+    register_disturbance), sem passar pela macro #[monjolo::disturbance] — mas desempenhando
+    exatamente o papel que o struct gerado desempenharia: guarda seus PRÓPRIOS Proxy (resolvidos
+    como qualquer `need::`/`offer::` comum) e os lê via `get_raw()`, nunca `get()` — essenciais,
+    porque `raw` pede as MESMAS chaves que o grupo intercepta, então também ganham `Some(Intercept)`
+    em `resolve()`; ler via `get()` reentraria em `apply()` (recursão infinita).
     */
-    fn shift_a_into_c(active: f64, raw: &[f64]) -> Vec<f64> {
-        if active == 0.0 {
-            return raw.to_vec();
-        }
-        vec![raw[0] - 0.03, raw[1], raw[2] + 0.03]
+    struct ShiftAIntoC {
+        active: Proxy,
+        raw: [Proxy; 3],
     }
 
-    /* Prova o ponto central do mecanismo: `offer_mixture` (quem publica) e `need_mixture` (quem
-    consome) não sabem nada do distúrbio — nenhum dos dois chama `register_disturbance`. Desligado,
-    `need` lê exatamente o que foi ofertado; ligado, lê o valor transformado — sem o ofertante nem
-    o consumidor mudarem uma linha.
+    impl DisturbanceInterceptor for ShiftAIntoC {
+        fn active(&self) -> f64 {
+            self.active.get_raw()
+        }
+
+        fn apply(&self) -> Vec<f64> {
+            let [a, b, c] = self.raw.each_ref().map(Proxy::get_raw);
+            vec![a - 0.03, b, c + 0.03]
+        }
+    }
+
+    /* Prova o ponto central do mecanismo: `offer` (quem publica) e `need` (quem consome) não sabem
+    nada do distúrbio — nenhum dos dois chama `register_disturbance`. Desligado, `need` lê
+    exatamente o que foi ofertado; ligado, lê o valor transformado — sem o ofertante nem o
+    consumidor mudarem uma linha.
     */
     #[test]
     fn a_registered_disturbance_intercepts_need_reads_transparently_while_active() {
@@ -871,8 +879,12 @@ mod tests {
         offered[2].set(0.45);
 
         let (active_offered, _) = registry.subscribe(&["disturbance.active"], &[]);
-
-        registry.register_disturbance(&["mix.a", "mix.b", "mix.c"], active_offered[0].clone(), shift_a_into_c);
+        let (_, raw_needed) = registry.subscribe(&[], &["mix.a", "mix.b", "mix.c"]);
+        let interceptor: Rc<dyn DisturbanceInterceptor> = Rc::new(ShiftAIntoC {
+            active: active_offered[0].clone(),
+            raw: [raw_needed[0].clone(), raw_needed[1].clone(), raw_needed[2].clone()],
+        });
+        registry.register_disturbance(&["mix.a", "mix.b", "mix.c"], interceptor);
 
         let (_, needed) = registry.subscribe(&[], &["mix.a", "mix.b", "mix.c"]);
         registry.resolve().expect("todo input deveria ter provedor");
@@ -889,6 +901,21 @@ mod tests {
         assert_eq!(needed[0].get(), 0.5, "desligado de novo: volta ao valor cru");
     }
 
+    struct AddOneHundred {
+        active: Proxy,
+        raw: Proxy,
+    }
+
+    impl DisturbanceInterceptor for AddOneHundred {
+        fn active(&self) -> f64 {
+            self.active.get_raw()
+        }
+
+        fn apply(&self) -> Vec<f64> {
+            vec![self.raw.get_raw() + 100.0]
+        }
+    }
+
     /* Quem OFERECE a chave não é afetado — só quem PEDE (`need::`). Isso é intencional: o
     ofertante deve continuar publicando o valor nominal; é o consumidor que vê a versão perturbada.
     */
@@ -900,7 +927,12 @@ mod tests {
         offered[0].set(0.5);
 
         let (active_offered, _) = registry.subscribe(&["disturbance.active"], &[]);
-        registry.register_disturbance(&["mix.a"], active_offered[0].clone(), |_active, raw| vec![raw[0] + 100.0]);
+        let (_, raw_needed) = registry.subscribe(&[], &["mix.a"]);
+        let interceptor: Rc<dyn DisturbanceInterceptor> = Rc::new(AddOneHundred {
+            active: active_offered[0].clone(),
+            raw: raw_needed[0].clone(),
+        });
+        registry.register_disturbance(&["mix.a"], interceptor);
 
         let (_, needed) = registry.subscribe(&[], &["mix.a"]);
         registry.resolve().expect("todo input deveria ter provedor");
@@ -910,11 +942,21 @@ mod tests {
         assert_eq!(needed[0].get(), 100.5, "quem pede vê o valor interceptado");
     }
 
+    /* register_disturbance() em si não valida chave nenhuma (ver sua doc) — o erro aqui vem do
+    need:: comum que o interceptador declara pra alimentar seu próprio apply(), igual qualquer
+    outro consumidor. Prova que a garantia "toda chave do grupo precisa de ofertante" sobrevive à
+    simplificação, só que por um caminho diferente do que existia antes.
+    */
     #[test]
-    fn resolve_errors_when_a_disturbance_group_key_has_no_offer() {
+    fn resolve_errors_when_the_interceptors_own_need_has_no_offer() {
         let mut registry = StateRegistry::new();
         let (active_offered, _) = registry.subscribe(&["disturbance.active"], &[]);
-        registry.register_disturbance(&["mix.missing"], active_offered[0].clone(), |_active, raw| raw.to_vec());
+        let (_, raw_needed) = registry.subscribe(&[], &["mix.missing"]);
+        let interceptor: Rc<dyn DisturbanceInterceptor> = Rc::new(AddOneHundred {
+            active: active_offered[0].clone(),
+            raw: raw_needed[0].clone(),
+        });
+        registry.register_disturbance(&["mix.missing"], interceptor);
         assert!(registry.resolve().is_err());
     }
 }

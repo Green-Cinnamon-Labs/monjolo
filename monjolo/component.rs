@@ -813,50 +813,50 @@ mod tests {
         assert_eq!(needed[2].get(), 4.0, "make_total lê a mistura inteira como um valor só e soma");
     }
 
-    /* Prova `#[disturbance(key = "...", intercepts = "...")]` SOZINHO (sem #[need]/#[offer]
-    empilhado) — o mecanismo NOVO, por interceptação (issue spec-tennessee-eastman#73): `InterceptSource`
-    publica uma chave comum, `InterceptSink` a lê via `need::` normal, sem saber que existe
-    distúrbio nenhum no meio, e `Interceptors::shift` (função PURA, sem `&self`) se registra contra
-    essa MESMA chave. Prova três coisas: (1) desligado, o valor passa reto; (2) ligado, o sink
-    enxerga o valor JÁ transformado, sem nenhum `after`/`need` ligando `Interceptors` a `InterceptSink`
-    — a interceptação não é um nó do grafo de dataflow, é um comportamento do `Proxy`; (3) o próprio
-    método vira o comando externo liga/desliga, catalogado como `Actuator` sob `key`.
+    /* Prova `#[monjolo::disturbance(key = "...", intercepts = "...")]` (issue spec-tennessee-eastman#73)
+    — mesmo padrão de `#[actuator]`/`#[sensor]`/`#[controller]`: struct sem campos, `impl` à parte
+    com um método convencional (`disturb(&self)`, sem parâmetro nenhum — lê via `self.raw()`,
+    igual `dynamics(&self)` lê via `self.command()`). `ScalarSource` publica uma chave comum,
+    `ScalarSink` a lê via `need::` normal, sem saber que existe distúrbio nenhum no meio, e
+    `ShiftDisturbance` se registra contra essa MESMA chave. Prova: (1) desligado, o valor passa
+    reto — `disturb()` nem chega a rodar; (2) ligado, o sink enxerga o valor JÁ transformado, sem
+    nenhum `after`/`need` ligando `ShiftDisturbance` a `ScalarSink` — a interceptação não é um nó
+    do grafo de dataflow; (3) o struct vira sozinho o comando externo liga/desliga, catalogado como
+    `Actuator` sob `key`; (4) não participa do grafo de needs/offers (`ComponentDescriptor` vazio).
     */
     #[monjolo_macros::dynamic_model(tasks)]
-    struct InterceptSource {}
+    struct ScalarSource {}
 
     #[monjolo_macros::tasks]
-    impl InterceptSource {
+    impl ScalarSource {
         #[task]
         fn publish(&self) {
-            offer::test__intercept__value = 100.0;
+            offer::test__disturbance__value = 100.0;
+        }
+    }
+
+    #[monjolo_macros::disturbance(key = "test.disturbance.shift", intercepts = "test.disturbance.value")]
+    struct ShiftDisturbance;
+
+    impl ShiftDisturbance {
+        fn disturb(&self) -> f64 {
+            self.raw() + 1.0
         }
     }
 
     #[monjolo_macros::dynamic_model(tasks)]
-    struct Interceptors {}
+    struct ScalarSink {}
 
     #[monjolo_macros::tasks]
-    impl Interceptors {
-        #[disturbance(key = "test.disturbance.shift", intercepts = "test.intercept.value")]
-        fn shift(active: f64, raw: f64) -> f64 {
-            if active != 0.0 { raw + 1.0 } else { raw }
-        }
-    }
-
-    #[monjolo_macros::dynamic_model(tasks)]
-    struct InterceptSink {}
-
-    #[monjolo_macros::tasks]
-    impl InterceptSink {
+    impl ScalarSink {
         #[task]
         fn read_back(&self) {
-            offer::test__intercept__sink = need::test__intercept__value;
+            offer::test__disturbance__sink = need::test__disturbance__value;
         }
     }
 
     #[test]
-    fn disturbance_interceptor_transparently_shifts_a_need_read_while_active() {
+    fn disturbance_macro_transparently_shifts_a_need_read_while_active() {
         let registry = StateRegistry::shared();
         let mut root = Composite::new();
         let config = Snapshot::from_pairs(&[]);
@@ -864,23 +864,23 @@ mod tests {
         attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
         registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
 
-        let (_, needed) = registry.borrow_mut().subscribe(&[], &["test.intercept.sink"]);
+        let (_, needed) = registry.borrow_mut().subscribe(&[], &["test.disturbance.sink"]);
         registry.borrow_mut().resolve().expect("chave já ofertada deveria resolver de novo sem erro");
 
         root.evaluate();
-        assert_eq!(needed[0].get(), 100.0, "desligado: InterceptSink deveria ler o valor cru, sem transformação");
+        assert_eq!(needed[0].get(), 100.0, "desligado: ScalarSink deveria ler o valor cru, sem transformação");
 
         let command = registry
             .borrow()
             .actuator("test.disturbance.shift")
-            .expect("Interceptors::shift deveria ter se catalogado sozinha como Actuator");
+            .expect("ShiftDisturbance deveria ter se catalogado sozinha como Actuator");
         command.write(1.0);
         root.evaluate();
         assert_eq!(
             needed[0].get(),
             101.0,
-            "ligado: InterceptSink deveria ler o valor JÁ transformado, sem nenhum need/after \
-            declarado entre Interceptors e InterceptSink",
+            "ligado: ScalarSink deveria ler o valor JÁ transformado, sem nenhum need/after \
+            declarado entre ShiftDisturbance e ScalarSink",
         );
 
         command.write(0.0);
@@ -888,18 +888,95 @@ mod tests {
         assert_eq!(needed[0].get(), 100.0, "desligado de novo: volta a ler o valor cru");
 
         let descriptor = inventory::iter::<ComponentDescriptor>()
-            .find(|d| d.name == "Interceptors::shift")
-            .expect("a tarefa deveria ter se registrado no inventory");
+            .find(|d| d.name == "ShiftDisturbance")
+            .expect("ShiftDisturbance deveria ter se registrado no inventory");
         assert_eq!(
             descriptor.kind,
             ComponentKind::Disturbance,
-            "deveria carimbar ComponentKind::Disturbance, não Dynamic",
+            "#[monjolo::disturbance] deveria carimbar ComponentKind::Disturbance, não Dynamic",
         );
         assert!(
             descriptor.needs.is_empty() && descriptor.offers.is_empty(),
             "o mecanismo novo não participa do grafo de needs/offers — a troca mora no Proxy, não \
             num evaluate() por tick",
         );
+    }
+
+    /* Mesma prova, forma `Mixture` (`components = [...] `+ `species = ...`) — usada de verdade por
+    `tep-plant/src/disturbance/idv1.rs`. `self.raw()`/`disturb()` trocam `f64` por `Mixture<N>`;
+    resto do contrato idêntico ao teste escalar acima.
+    */
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct MixtureSource {}
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::tasks(species = MIX_SPECIES, len = 2)]
+    impl MixtureSource {
+        #[task]
+        fn publish(&self) {
+            offer::test__mix_disturbance__value::<Mixture> = crate::chemistry::Mixture::new([10.0, 20.0], &MIX_SPECIES);
+        }
+    }
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::disturbance(
+        key = "test.mix_disturbance.shift",
+        intercepts = "test.mix_disturbance.value",
+        components = ["a", "b"],
+        species = MIX_SPECIES
+    )]
+    struct MixtureShiftDisturbance;
+
+    #[cfg(feature = "chemistry")]
+    impl MixtureShiftDisturbance {
+        fn disturb(&self) -> crate::chemistry::Mixture<2> {
+            let raw = self.raw();
+            crate::chemistry::Mixture::new([raw.component(0) + 1.0, raw.component(1)], &MIX_SPECIES)
+        }
+    }
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct MixtureSink {}
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::tasks(species = MIX_SPECIES, len = 2)]
+    impl MixtureSink {
+        #[task]
+        fn read_back(&self) {
+            offer::test__mix_disturbance__sink::<Mixture> = need::test__mix_disturbance__value::<Mixture>;
+        }
+    }
+
+    #[cfg(feature = "chemistry")]
+    #[test]
+    fn disturbance_macro_works_with_a_mixture_group() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+
+        let (_, needed) = registry.borrow_mut().subscribe(
+            &[],
+            &["test.mix_disturbance.sink.a", "test.mix_disturbance.sink.b"],
+        );
+        registry.borrow_mut().resolve().expect("chaves já ofertadas deveriam resolver de novo sem erro");
+
+        root.evaluate();
+        assert_eq!(needed[0].get(), 10.0, "desligado: componente a crua");
+        assert_eq!(needed[1].get(), 20.0, "desligado: componente b crua");
+
+        let command = registry
+            .borrow()
+            .actuator("test.mix_disturbance.shift")
+            .expect("MixtureShiftDisturbance deveria ter se catalogado sozinha como Actuator");
+        command.write(1.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 11.0, "ligado: componente a transformada");
+        assert_eq!(needed[1].get(), 20.0, "ligado: componente b intocada");
     }
 
     /* Prova #[need(prefix = ..., components = [...])] — forma array, usada por Flows (precisa de

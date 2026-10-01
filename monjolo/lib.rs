@@ -30,7 +30,7 @@ serde usa pra `Serialize` (trait) e `Serialize` (derive) coexistirem sob o mesmo
 `monjolo-macros` é crate-only-macro (ver seu Cargo.toml); quem usa `monjolo` nunca precisa saber
 que ele existe.
 */
-pub use monjolo_macros::{actuator, controller, dynamic_model, sensor, tasks};
+pub use monjolo_macros::{actuator, controller, disturbance, dynamic_model, sensor, tasks};
 
 pub use component::{
     attach_discovered_components, describe_phase_a_execution_order, phase_a_execution_order,
