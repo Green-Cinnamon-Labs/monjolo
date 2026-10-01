@@ -52,6 +52,36 @@ pub struct StateSlot {
     pub value: f64,
 }
 
+/** Implementado pelo struct que `#[monjolo::disturbance(...)]` gera (mesma família de
+`#[actuator]`/`#[sensor]`/`#[controller]`: struct com campos escondidos + getters, usuário escreve
+um `impl` à parte com um método convencional — aqui, `disturb(&self)`). `active()` é barato (um
+único `Proxy::get()`) e decide se vale a pena chamar `apply()`; `apply(raw)` recebe o grupo INTEIRO
+como veio do estágio anterior da cadeia (o `offer::` original, ou o resultado de outro
+`#[disturbance]` que intercepta a mesma chave antes deste) e devolve o grupo já transformado, na
+MESMA ordem — `Proxy`, do lado de quem oferece, não sabe nada do que tem por trás: nem `Mixture`,
+nem química, nem quantos estágios existem.
+*/
+pub trait DisturbanceInterceptor {
+    fn active(&self) -> f64;
+    fn apply(&self, raw: &[f64]) -> Vec<f64>;
+}
+
+/** Aplica uma CADEIA de interceptadores, em ordem de registro, sobre o valor cru de um grupo —
+cada estágio só roda se `active() != 0.0`; desligado, o valor passa pro próximo estágio intocado.
+Dois (ou mais) `#[disturbance]` podem registrar a MESMA chave de propósito agora — é assim que
+IDV(1) e IDV(2) do TEP convivem de verdade (o `teprob.f` original SOMA os dois efeitos sobre a
+mesma composição; encadear dá exatamente essa soma, ver `docs/17-disturbio-por-interceptacao.md`).
+*/
+fn apply_chain(chain: &[Rc<dyn DisturbanceInterceptor>], raw: &[f64]) -> Vec<f64> {
+    let mut value = raw.to_vec();
+    for interceptor in chain {
+        if interceptor.active() != 0.0 {
+            value = interceptor.apply(&value);
+        }
+    }
+    value
+}
+
 /** Handle autossuficiente pra uma posição no buffer de avaliação — carrega o buffer compartilhado
 (`Rc<RefCell<Vec<Cell<f64>>>>`) e o índice (`Rc<Cell<usize>>`) juntos, então `get()`/`set()` não
 precisam de nada externo passado por parâmetro. Nasce sem resolução (`index = usize::MAX`);
@@ -66,6 +96,13 @@ Agnóstico a se o valor por trás é "hipotético" (chute intermediário de um s
 pub struct Proxy {
     buffer: Rc<RefCell<Vec<Cell<f64>>>>,
     index: Rc<Cell<usize>>,
+    /** `None` pra quase toda `Proxy` do sistema — só ganha `Some` se `resolve()` achar, pra esta
+    chave, uma cadeia de `#[disturbance]` registrada. A decisão "esta chave tem distúrbio?" é
+    tomada UMA vez, aqui dentro de `resolve()`, nunca em `set()` — ver `register_disturbance`.
+    Compartilhado por TODO `Proxy` do mesmo grupo (mesma cadeia, mesmo `Rc`) — é o que permite
+    `set_group()` achar a cadeia olhando só pro primeiro membro do grupo.
+    */
+    write_chain: Rc<RefCell<Option<Rc<Vec<Rc<dyn DisturbanceInterceptor>>>>>>,
 }
 
 impl Proxy {
@@ -73,6 +110,7 @@ impl Proxy {
         Self {
             buffer,
             index: Rc::new(Cell::new(index)),
+            write_chain: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -80,6 +118,7 @@ impl Proxy {
         Self {
             buffer,
             index: Rc::new(Cell::new(usize::MAX)),
+            write_chain: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -92,12 +131,48 @@ impl Proxy {
         idx
     }
 
+    fn set_raw(&self, value: f64) {
+        self.buffer.borrow()[self.index()].set(value);
+    }
+
     pub fn get(&self) -> f64 {
         self.buffer.borrow()[self.index()].get()
     }
 
+    /** Escalar (grupo de 1) — se houver cadeia registrada pra esta chave, `value` passa por ela
+    antes de ser gravado; sem cadeia, grava direto, igual sempre. Grupos `Mixture` NÃO passam por
+    aqui — usam `set_group()` (abaixo), porque a cadeia precisa ver os N componentes do MESMO tick
+    de uma vez, nunca um só.
+    */
     pub fn set(&self, value: f64) {
-        self.buffer.borrow()[self.index()].set(value);
+        match self.write_chain.borrow().as_ref() {
+            None => self.set_raw(value),
+            Some(chain) => self.set_raw(apply_chain(chain, &[value])[0]),
+        }
+    }
+
+    /** Contraparte de `set()` pra grupos `Mixture` — `proxies`/`values` são os N membros do grupo,
+    na MESMA ordem (`#[task]` gera isto em vez de um loop de `set()` por componente, exatamente pra
+    garantir que a cadeia, se houver, veja o grupo inteiro de um tick só, nunca uma mistura de
+    componentes de ticks diferentes). A cadeia (se houver) está anexada em TODO Proxy do grupo —
+    olhar só o primeiro basta, já que `resolve()` anexa o MESMO `Rc` em todos eles.
+    */
+    pub fn set_group(proxies: &[Proxy], values: &[f64]) {
+        debug_assert_eq!(proxies.len(), values.len(), "set_group: proxies e values precisam ter o mesmo tamanho");
+        let chain = proxies.first().and_then(|p| p.write_chain.borrow().clone());
+        match chain {
+            None => {
+                for (proxy, &value) in proxies.iter().zip(values) {
+                    proxy.set_raw(value);
+                }
+            }
+            Some(chain) => {
+                let transformed = apply_chain(&chain, values);
+                for (proxy, value) in proxies.iter().zip(transformed) {
+                    proxy.set_raw(value);
+                }
+            }
+        }
     }
 }
 
@@ -298,6 +373,26 @@ pub struct StateRegistry {
     */
     instance_catalog: Rc<RefCell<Vec<Rc<dyn std::any::Any>>>>,
     instance_index: HashMap<String, usize>,
+
+    /** Distúrbios registrados por interceptação (ver `register_disturbance`) — cada entrada é um
+    grupo de chaves + o interceptador que sabe transformá-las. `resolve()` consulta esta lista UMA
+    vez, no final, pra montar a cadeia de cada grupo e anexá-la ao(s) `Proxy` que OFERECE aquelas
+    chaves (ver `offered_proxies` abaixo); depois disso, nunca mais é consultada.
+    */
+    disturbances: Vec<DisturbanceRegistration>,
+
+    /** `Proxy` que cada chave OFERECIDA resolve pra — populado em `subscribe()`, junto com `index`.
+    Existe só pra `resolve()` conseguir achar "o Proxy que publica a chave X" e anexar nele a cadeia
+    de distúrbios registrada (ver `register_disturbance`/`Proxy::write_chain`) — nenhum outro código
+    deste arquivo lê isto; não é um segundo `index`, é um atalho pro objeto `Proxy` em si (que
+    `index` sozinho não guarda).
+    */
+    offered_proxies: HashMap<String, Proxy>,
+}
+
+struct DisturbanceRegistration {
+    keys: Vec<String>,
+    interceptor: Rc<dyn DisturbanceInterceptor>,
 }
 
 impl StateRegistry {
@@ -321,6 +416,8 @@ impl StateRegistry {
             controller_index: HashMap::new(),
             instance_catalog: Rc::new(RefCell::new(Vec::new())),
             instance_index: HashMap::new(),
+            disturbances: Vec::new(),
+            offered_proxies: HashMap::new(),
         }
     }
 
@@ -361,7 +458,9 @@ impl StateRegistry {
                 let idx = self.evaluation_state.borrow().len();
                 self.evaluation_state.borrow_mut().push(Cell::new(0.0));
                 self.index.insert(key.to_string(), idx);
-                Proxy::resolved(self.evaluation_state.clone(), idx)
+                let proxy = Proxy::resolved(self.evaluation_state.clone(), idx);
+                self.offered_proxies.insert(key.to_string(), proxy.clone());
+                proxy
             })
             .collect();
 
@@ -509,6 +608,29 @@ impl StateRegistry {
         any.downcast::<T>().ok()
     }
 
+    /** Registra um distúrbio por interceptação: qualquer `offer::` pra uma chave deste grupo passa
+    a, quando `interceptor.active()` estiver ligado (!= 0.0), ser transformado por
+    `interceptor.apply(valor_cru)` antes de ser gravado — sem o componente que OFERECE a chave
+    (ex.: `Feed`) nem o que a PEDE (ex.: `Stripper`) saberem que isto existe. Chamado durante
+    `construct()`, pelo struct que `#[monjolo::disturbance(...)]` gera — nunca diretamente por
+    código de planta.
+
+    `keys` precisa estar na MESMA ordem que `interceptor.apply()` espera/devolve (ex.:
+    `["...a","...b",...]` pros 8 componentes de uma `Mixture`, mesma convenção de `need::`/
+    `offer::`). Várias chamadas pra um MESMO grupo de chaves são válidas de propósito — formam uma
+    CADEIA, aplicada em ordem de registro (ver `apply_chain`): é assim que dois `#[disturbance]`
+    que afetam a mesma chave (ex.: IDV(1) e IDV(2) do TEP, que se somam sobre a composição do mesmo
+    stream no `teprob.f` de verdade) convivem sem um apagar o outro. A chave em si precisa já ter
+    um ofertante real — `resolve()` erra se não tiver (um distúrbio nunca CRIA o valor que
+    intercepta, só modifica um que já existe).
+    */
+    pub fn register_disturbance(&mut self, keys: &[&str], interceptor: Rc<dyn DisturbanceInterceptor>) {
+        self.disturbances.push(DisturbanceRegistration {
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            interceptor,
+        });
+    }
+
     /** Roda uma única vez, depois que tudo já se registrou — slots, sensores e atuadores. Resolve
     cada pendência contra a posição já conhecida (de quem ofereceu aquele nome). Se algum input não
     tiver provedor, é erro — o resto pode ter ficado parcialmente resolvido, então não adianta
@@ -522,6 +644,38 @@ impl StateRegistry {
                     return Err(format!(
                     "input '{key}' declarado em subscribe() mas nenhum componente oferece esse slot"
                 ))
+                }
+            }
+        }
+
+        /* Agrupa registros de distúrbio por conjunto de chaves — vários `#[disturbance]` PODEM (e
+        devem poder) compartilhar o MESMO grupo, formando uma cadeia aplicada em ordem de registro
+        (ver `apply_chain`). Cada chave do grupo precisa já ter um Proxy OFERECIDO de verdade
+        (`offered_proxies`, populado em `subscribe()`) — um distúrbio nunca é o criador do valor que
+        intercepta, só o modifica; sem ofertante real, é erro, igual qualquer `need::` sem provedor.
+        */
+        let mut chains_by_keys: Vec<(&Vec<String>, Vec<Rc<dyn DisturbanceInterceptor>>)> = Vec::new();
+        for disturbance in &self.disturbances {
+            match chains_by_keys.iter_mut().find(|(keys, _)| *keys == &disturbance.keys) {
+                Some((_, chain)) => chain.push(disturbance.interceptor.clone()),
+                None => chains_by_keys.push((&disturbance.keys, vec![disturbance.interceptor.clone()])),
+            }
+        }
+
+        for (keys, chain) in chains_by_keys {
+            let chain: Rc<Vec<Rc<dyn DisturbanceInterceptor>>> = Rc::new(chain);
+            for key in keys {
+                match self.offered_proxies.get(key) {
+                    Some(proxy) => {
+                        *proxy.write_chain.borrow_mut() = Some(chain.clone());
+                    }
+                    None => {
+                        return Err(format!(
+                            "#[disturbance] registrado pra '{key}' mas nenhum componente oferece \
+                            esse slot (um distúrbio nunca cria o valor que intercepta, só modifica \
+                            um que já existe)"
+                        ));
+                    }
                 }
             }
         }
@@ -735,5 +889,146 @@ mod tests {
         let mut registry = StateRegistry::new();
         registry.offer_instance("Reactor", Rc::new(DummyUnit { label: "Reactor" }));
         assert!(registry.instance::<DummyActuator>("Reactor").is_none());
+    }
+
+    /* ShiftAIntoC: igual à transformação real do IDV(1) — A cai 0.03, C absorve, B intocado. Testa
+    só o mecanismo de interceptação do StateRegistry (DisturbanceInterceptor/register_disturbance/
+    Proxy::set_group), sem passar pela macro #[monjolo::disturbance] — `apply(raw)` RECEBE o valor
+    cru como parâmetro (o que `offer::`/`Proxy::set_group` está prestes a gravar), não lê Proxy
+    nenhum por conta própria — por isso não precisa guardar `raw: [Proxy; 3]` feito antes.
+    */
+    struct ShiftAIntoC {
+        active: Proxy,
+    }
+
+    impl DisturbanceInterceptor for ShiftAIntoC {
+        fn active(&self) -> f64 {
+            self.active.get()
+        }
+
+        fn apply(&self, raw: &[f64]) -> Vec<f64> {
+            vec![raw[0] - 0.03, raw[1], raw[2] + 0.03]
+        }
+    }
+
+    /* Prova o ponto central do mecanismo NOVO (interceptação no `offer::`, não no `need::`):
+    `Proxy::set_group` é quem aplica a cadeia, uma vez por escrita — por isso o teste escreve de
+    novo a cada cenário (desligado/ligado/desligado), em vez de só girar o `active` como antes: o
+    valor gravado só reflete o distúrbio na escrita SEGUINTE a ele, igual um `#[task]` real que
+    reescreve `flows.stream4_composition` todo tick.
+    */
+    #[test]
+    fn a_registered_disturbance_transforms_the_value_at_offer_time_while_active() {
+        let mut registry = StateRegistry::new();
+
+        let (offered, _) = registry.subscribe(&["mix.a", "mix.b", "mix.c"], &[]);
+
+        let (active_offered, _) = registry.subscribe(&["disturbance.active"], &[]);
+        let interceptor: Rc<dyn DisturbanceInterceptor> = Rc::new(ShiftAIntoC {
+            active: active_offered[0].clone(),
+        });
+        registry.register_disturbance(&["mix.a", "mix.b", "mix.c"], interceptor);
+
+        let (_, needed) = registry.subscribe(&[], &["mix.a", "mix.b", "mix.c"]);
+        registry.resolve().expect("todo input deveria ter provedor");
+
+        Proxy::set_group(&offered, &[0.5, 0.05, 0.45]);
+        assert_eq!(needed[0].get(), 0.5, "desligado: A passa reto");
+        assert_eq!(needed[2].get(), 0.45, "desligado: C passa reto");
+
+        active_offered[0].set(1.0);
+        Proxy::set_group(&offered, &[0.5, 0.05, 0.45]);
+        assert!((needed[0].get() - 0.47).abs() < 1e-12, "ligado: A cai 0.03");
+        assert_eq!(needed[1].get(), 0.05, "ligado: B continua intocado");
+        assert!((needed[2].get() - 0.48).abs() < 1e-12, "ligado: C absorve a diferença");
+
+        active_offered[0].set(0.0);
+        Proxy::set_group(&offered, &[0.5, 0.05, 0.45]);
+        assert_eq!(needed[0].get(), 0.5, "desligado de novo: volta ao valor cru");
+    }
+
+    struct AddOneHundred {
+        active: Proxy,
+    }
+
+    impl DisturbanceInterceptor for AddOneHundred {
+        fn active(&self) -> f64 {
+            self.active.get()
+        }
+
+        fn apply(&self, raw: &[f64]) -> Vec<f64> {
+            vec![raw[0] + 100.0]
+        }
+    }
+
+    /* MUDANÇA DE COMPORTAMENTO deliberada (issue spec-tennessee-eastman#73): a versão anterior deste
+    mecanismo interceptava no `need::`, e só quem PEDIA via o valor transformado — quem oferecia
+    via o cru. Migrado pro `offer::`, só existe UM valor gravado por slot; quem oferece e quem pede
+    enxergam a MESMA coisa, já transformada. Intencional — ver docs/17-disturbio-por-interceptacao.md.
+    */
+    #[test]
+    fn a_registered_disturbance_transforms_the_value_for_the_offering_proxy_too() {
+        let mut registry = StateRegistry::new();
+
+        let (offered, _) = registry.subscribe(&["mix.a"], &[]);
+
+        let (active_offered, _) = registry.subscribe(&["disturbance.active"], &[]);
+        let interceptor: Rc<dyn DisturbanceInterceptor> = Rc::new(AddOneHundred {
+            active: active_offered[0].clone(),
+        });
+        registry.register_disturbance(&["mix.a"], interceptor);
+
+        let (_, needed) = registry.subscribe(&[], &["mix.a"]);
+        registry.resolve().expect("todo input deveria ter provedor");
+
+        active_offered[0].set(1.0);
+        offered[0].set(0.5);
+
+        assert_eq!(offered[0].get(), 100.5, "quem oferece também vê o valor já transformado — é o MESMO slot");
+        assert_eq!(needed[0].get(), 100.5, "quem pede vê o mesmo valor");
+    }
+
+    /* register_disturbance() em si não valida chave nenhuma — a garantia "toda chave precisa de
+    ofertante real" é checada explicitamente em resolve(), contra `offered_proxies`. Um distúrbio
+    nunca é o criador do valor que intercepta, só modifica um que já existe.
+    */
+    #[test]
+    fn resolve_errors_when_a_disturbance_key_has_no_real_offer() {
+        let mut registry = StateRegistry::new();
+        let (active_offered, _) = registry.subscribe(&["disturbance.active"], &[]);
+        let interceptor: Rc<dyn DisturbanceInterceptor> = Rc::new(AddOneHundred {
+            active: active_offered[0].clone(),
+        });
+        registry.register_disturbance(&["mix.missing"], interceptor);
+        assert!(registry.resolve().is_err());
+    }
+
+    /* Caso real que motivou a cadeia: IDV(1) e IDV(2) do TEP se somam sobre A/B/C do mesmo stream
+    no `teprob.f` de verdade. Dois `#[disturbance]` registrando a MESMA chave não é erro — é o
+    caminho pretendido: formam uma cadeia, aplicada em ordem de registro, cada estágio vendo o
+    resultado do anterior (`AddOneHundred` duas vezes empilhadas = +200, não "um apaga o outro").
+    */
+    #[test]
+    fn two_disturbances_on_the_same_key_chain_in_registration_order() {
+        let mut registry = StateRegistry::new();
+
+        let (offered, _) = registry.subscribe(&["mix.a"], &[]);
+
+        let (active_a, _) = registry.subscribe(&["disturbance.a"], &[]);
+        let interceptor_a: Rc<dyn DisturbanceInterceptor> = Rc::new(AddOneHundred { active: active_a[0].clone() });
+        registry.register_disturbance(&["mix.a"], interceptor_a);
+
+        let (active_b, _) = registry.subscribe(&["disturbance.b"], &[]);
+        let interceptor_b: Rc<dyn DisturbanceInterceptor> = Rc::new(AddOneHundred { active: active_b[0].clone() });
+        registry.register_disturbance(&["mix.a"], interceptor_b);
+
+        let (_, needed) = registry.subscribe(&[], &["mix.a"]);
+        registry.resolve().expect("todo input deveria ter provedor");
+
+        active_a[0].set(1.0);
+        active_b[0].set(1.0);
+        offered[0].set(0.5);
+
+        assert_eq!(needed[0].get(), 200.5, "os dois estágios aplicam em sequência: 0.5 + 100 + 100");
     }
 }

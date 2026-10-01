@@ -71,6 +71,17 @@ não entram em `root`, mas `construct()` ainda roda (é o que cataloga a instân
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentKind {
     Dynamic,
+    /** Mesma fase (A) de `Dynamic` — participa do MESMO `sort_phase_a`, misturado no mesmo grafo de
+    `needs`/`offers` (ver `attach_discovered_components`), não um bucket fixo separado como
+    `Actuator`/`Controller`/`Sensor`. Existe como valor próprio (não reaproveita `Dynamic`) só pra
+    identidade/diagnóstico — ex.: `describe_phase_a_execution_order()` consegue apontar "isto é um
+    distúrbio, não física" sem precisar de outra fonte de verdade. Um distúrbio típico `#[need]` a
+    grandeza NOMINAL (publicada por quem a possui de verdade) e `#[offer]` a mesma grandeza de volta,
+    já `write()`-alterada ou não (nunca acrescenta campo/chave nova) — quem consome só enxerga a
+    chave pública, nunca sabe que existe um distúrbio no meio (ver `#[monjolo::tasks(disturbance =
+    "chave")]`, issue spec-tennessee-eastman#73).
+    */
+    Disturbance,
     Actuator,
     Controller,
     Sensor,
@@ -129,7 +140,7 @@ pub fn attach_discovered_components(root: &mut Composite, registry: &mut StateRe
 
     for descriptor in inventory::iter::<ComponentDescriptor> {
         match descriptor.kind {
-            ComponentKind::Dynamic => phase_a.push(descriptor),
+            ComponentKind::Dynamic | ComponentKind::Disturbance => phase_a.push(descriptor),
             ComponentKind::Actuator => phase_b.push(descriptor),
             ComponentKind::Controller => phase_c.push(descriptor),
             ComponentKind::Sensor => sensors.push(descriptor),
@@ -152,8 +163,9 @@ pub fn attach_discovered_components(root: &mut Composite, registry: &mut StateRe
     }
 }
 
-/** Ordem de execução REAL da fase (A) — física (`ComponentKind::Dynamic`), onde mora o acoplamento
-entre unidades que este artefato existe pra inspecionar (issue spec-tennessee-eastman#71). Mesma
+/** Ordem de execução REAL da fase (A) — física (`ComponentKind::Dynamic`) MAIS distúrbios
+(`ComponentKind::Disturbance`, mesmo grafo/mesmo sort — ver comentário do enum), onde mora o
+acoplamento entre unidades que este artefato existe pra inspecionar (issue spec-tennessee-eastman#71). Mesma
 lógica que `attach_discovered_components` já roda por dentro, só que sem construir nada — não
 precisa de `StateRegistry`/`Snapshot`/planta nenhuma, porque `name`/`after`/`needs`/`offers` são
 todos `&'static`: já existem completos assim que o binário termina de linkar (é isso que
@@ -163,7 +175,7 @@ próprio `Runtime::bootstrap()` — sem nenhum outro pré-requisito.
 */
 pub fn phase_a_execution_order() -> Vec<&'static ComponentDescriptor> {
     let phase_a: Vec<&'static ComponentDescriptor> = inventory::iter::<ComponentDescriptor>()
-        .filter(|descriptor| descriptor.kind == ComponentKind::Dynamic)
+        .filter(|descriptor| matches!(descriptor.kind, ComponentKind::Dynamic | ComponentKind::Disturbance))
         .collect();
     sort_phase_a(phase_a)
 }
@@ -642,6 +654,389 @@ mod tests {
             "DownstreamTaskUnit::tripled deveria ler 20.0 já publicado por TaskDrivenUnit::doubled \
             (SEM after declarado entre as duas unidades) e publicar 30.0",
         );
+    }
+
+    /* Prova `#[disturbance(key = "chave")]` (issue spec-tennessee-eastman#73), atributo de MÉTODO
+    (não do `impl` inteiro — cada método tem sua própria chave): mesma mecânica de
+    `#[monjolo::tasks]` comum (need→offer, grafo automático por chave, `after` auto-injetado) — o
+    `ComponentKind` do descritor gerado é `Disturbance`, não `Dynamic`, E o próprio método vira o
+    comando externo liga/desliga (a tarefa gerada também implementa `Actuator`, catalogada sob
+    `chave`). Reusa `TaskDrivenUnit` (acima) como fonte do valor nominal, pra provar que os dois
+    kinds convivem no MESMO grafo/fase sem `after` nenhum entre eles.
+    */
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct DisturbedUnit {}
+
+    #[monjolo_macros::tasks]
+    impl DisturbedUnit {
+        #[disturbance(key = "test.disturbance.flag")]
+        #[need(key = "test.task_unit.doubled")]
+        #[offer(key = "test.task_unit.disturbed")]
+        fn perturb(&self, active: f64, nominal: f64) -> f64 {
+            if active != 0.0 { nominal + 1.0 } else { nominal }
+        }
+    }
+
+    #[test]
+    fn tasks_disturbance_flag_stamps_kind_and_is_its_own_external_command() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[("test.task_unit.state.level", 10.0)]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+
+        let (_, needed) = registry.borrow_mut().subscribe(&[], &["test.task_unit.disturbed"]);
+        registry.borrow_mut().resolve().expect("chave já ofertada deveria resolver de novo sem erro");
+
+        root.evaluate();
+        assert_eq!(needed[0].get(), 20.0, "desligado: passa o nominal (20.0, de TaskDrivenUnit::doubled) sem alterar");
+
+        let command = registry
+            .borrow()
+            .actuator("test.disturbance.flag")
+            .expect("a própria tarefa deveria ter se catalogado como Actuator sob a chave do disturbance");
+        command.write(1.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 21.0, "ligado: nominal + 1, sem nenhum #[need] declarado à mão pro comando");
+
+        let descriptor = inventory::iter::<ComponentDescriptor>()
+            .find(|d| d.name == "DisturbedUnit::perturb")
+            .expect("a tarefa deveria ter se registrado no inventory");
+        assert_eq!(
+            descriptor.kind,
+            ComponentKind::Disturbance,
+            "#[monjolo::tasks(disturbance = ...)] deveria carimbar ComponentKind::Disturbance, não Dynamic",
+        );
+    }
+
+    /* Prova `#[task]` + `need::`/`offer::` (issue spec-tennessee-eastman#73, sucessor de
+    `#[need]`/`#[offer]` por método): nenhum atributo, parâmetro, retorno nem campo de struct — o
+    corpo lê `need::nome` e escreve `offer::nome = valor;`, e a macro registra as chaves (com `__`
+    virando `.`: `test__signal__b` é a chave "test.signal.b") e deriva `needs`/`offers` daí.
+    `make_c` está declarado ANTES de `make_b` no código-fonte de propósito, mas LÊ o que `make_b`
+    escreve, que por sua vez lê o que `make_a` escreve — a ordem de execução (a, b, c) só pode vir
+    do grafo derivado do corpo, não da ordem em que os métodos aparecem. `let base` prova que
+    variável local comum fica intocada pela reescrita.
+    */
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct SignalUnit {}
+
+    #[monjolo_macros::tasks]
+    impl SignalUnit {
+        #[task]
+        fn make_c(&self) {
+            offer::test__signal__c = need::test__signal__b * 10.0;
+        }
+
+        #[task]
+        fn make_b(&self) {
+            let base = 2.0;
+            offer::test__signal__b = base + need::test__signal__a;
+        }
+
+        #[task]
+        fn make_a(&self) {
+            offer::test__signal__a = 0.5;
+        }
+    }
+
+    #[test]
+    fn signal_tasks_derive_execution_order_from_the_body_not_source_order() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &Snapshot::from_pairs(&[]));
+        registry.borrow_mut().resolve().expect("todo need deveria ter um offer");
+
+        let (_, needed) = registry
+            .borrow_mut()
+            .subscribe(&[], &["test.signal.a", "test.signal.b", "test.signal.c"]);
+        registry.borrow_mut().resolve().expect("chaves já ofertadas deveriam resolver de novo sem erro");
+
+        root.evaluate();
+
+        assert_eq!(needed[0].get(), 0.5, "make_a deveria publicar a = 0.5");
+        assert_eq!(needed[1].get(), 2.5, "make_b deveria ler a = 0.5 e publicar b = 2.0 + 0.5");
+        assert_eq!(
+            needed[2].get(),
+            25.0,
+            "make_c está declarado antes de make_b no código-fonte, mas lê b — só dá 25.0 se a ordem \
+            veio do corpo (`need::`/`offer::`), não da ordem dos métodos"
+        );
+    }
+
+    /* Sinal-MISTURA: `need::nome::<Mixture>` / `offer::nome::<Mixture>` lêem/escrevem uma `Mixture` de
+    `len` componentes como UM valor só — a macro publica `len` chaves (`test.mix.pair.a`, `.b`) e
+    ninguém escreve array. Precisa de `species`/`len` no `#[monjolo::tasks(...)]`, e da feature
+    `chemistry` (é onde `Mixture` mora).
+    */
+    #[cfg(feature = "chemistry")]
+    const MIX_SPECIES: crate::chemistry::Species<2> = ["X", "Y"];
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct MixtureSignalUnit {}
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::tasks(species = MIX_SPECIES, len = 2)]
+    impl MixtureSignalUnit {
+        #[task]
+        fn make_total(&self) {
+            offer::test__mix__total = need::test__mix__pair::<Mixture>.total();
+        }
+
+        #[task]
+        fn make_pair(&self) {
+            offer::test__mix__pair::<Mixture> = crate::chemistry::Mixture::new([1.0, 3.0], &MIX_SPECIES);
+        }
+    }
+
+    #[cfg(feature = "chemistry")]
+    #[test]
+    fn signal_tasks_publish_and_read_a_mixture_as_one_value() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &Snapshot::from_pairs(&[]));
+        registry.borrow_mut().resolve().expect("todo need deveria ter um offer");
+
+        let (_, needed) = registry
+            .borrow_mut()
+            .subscribe(&[], &["test.mix.pair.a", "test.mix.pair.b", "test.mix.total"]);
+        registry.borrow_mut().resolve().expect("chaves já ofertadas deveriam resolver de novo sem erro");
+
+        root.evaluate();
+
+        assert_eq!(needed[0].get(), 1.0, "componente `a` da mistura publicada");
+        assert_eq!(needed[1].get(), 3.0, "componente `b` da mistura publicada");
+        assert_eq!(needed[2].get(), 4.0, "make_total lê a mistura inteira como um valor só e soma");
+    }
+
+    /* Prova `#[monjolo::disturbance(key = "...", intercepts = "...")]` (issue spec-tennessee-eastman#73)
+    — mesmo padrão de `#[actuator]`/`#[sensor]`/`#[controller]`: struct sem campos, `impl` à parte
+    com um método convencional (`disturb(&self)`, sem parâmetro nenhum — lê via `self.raw()`,
+    igual `dynamics(&self)` lê via `self.command()`). `ScalarSource` publica uma chave comum,
+    `ScalarSink` a lê via `need::` normal, sem saber que existe distúrbio nenhum no meio, e
+    `ShiftDisturbance` se registra contra essa MESMA chave. Prova: (1) desligado, o valor passa
+    reto — `disturb()` nem chega a rodar; (2) ligado, o sink enxerga o valor JÁ transformado, sem
+    nenhum `after`/`need` ligando `ShiftDisturbance` a `ScalarSink` — a interceptação não é um nó
+    do grafo de dataflow; (3) o struct vira sozinho o comando externo liga/desliga, catalogado como
+    `Actuator` sob `key`; (4) não participa do grafo de needs/offers (`ComponentDescriptor` vazio).
+    */
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct ScalarSource {}
+
+    #[monjolo_macros::tasks]
+    impl ScalarSource {
+        #[task]
+        fn publish(&self) {
+            offer::test__disturbance__value = 100.0;
+        }
+    }
+
+    #[monjolo_macros::disturbance(key = "test.disturbance.shift", intercepts = "test.disturbance.value")]
+    struct ShiftDisturbance;
+
+    impl ShiftDisturbance {
+        fn disturb(&self) -> f64 {
+            self.raw() + 1.0
+        }
+    }
+
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct ScalarSink {}
+
+    #[monjolo_macros::tasks]
+    impl ScalarSink {
+        #[task]
+        fn read_back(&self) {
+            offer::test__disturbance__sink = need::test__disturbance__value;
+        }
+    }
+
+    #[test]
+    fn disturbance_macro_transparently_shifts_a_need_read_while_active() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+
+        let (_, needed) = registry.borrow_mut().subscribe(&[], &["test.disturbance.sink"]);
+        registry.borrow_mut().resolve().expect("chave já ofertada deveria resolver de novo sem erro");
+
+        root.evaluate();
+        assert_eq!(needed[0].get(), 100.0, "desligado: ScalarSink deveria ler o valor cru, sem transformação");
+
+        let command = registry
+            .borrow()
+            .actuator("test.disturbance.shift")
+            .expect("ShiftDisturbance deveria ter se catalogado sozinha como Actuator");
+        command.write(1.0);
+        root.evaluate();
+        assert_eq!(
+            needed[0].get(),
+            101.0,
+            "ligado: ScalarSink deveria ler o valor JÁ transformado, sem nenhum need/after \
+            declarado entre ShiftDisturbance e ScalarSink",
+        );
+
+        command.write(0.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 100.0, "desligado de novo: volta a ler o valor cru");
+
+        let descriptor = inventory::iter::<ComponentDescriptor>()
+            .find(|d| d.name == "ShiftDisturbance")
+            .expect("ShiftDisturbance deveria ter se registrado no inventory");
+        assert_eq!(
+            descriptor.kind,
+            ComponentKind::Disturbance,
+            "#[monjolo::disturbance] deveria carimbar ComponentKind::Disturbance, não Dynamic",
+        );
+        assert!(
+            descriptor.needs.is_empty() && descriptor.offers.is_empty(),
+            "o mecanismo novo não participa do grafo de needs/offers — a troca mora no Proxy, não \
+            num evaluate() por tick",
+        );
+    }
+
+    /* Prova a capacidade nova da migração pro `offer::` (issue spec-tennessee-eastman#73): DOIS
+    `#[monjolo::disturbance]` registrando a MESMA chave formam uma CADEIA, não um conflito — é
+    assim que IDV(1) e IDV(2) do TEP de verdade convivem (o `teprob.f` original soma os dois
+    efeitos sobre a mesma composição). `ChainSource` publica uma vez; `AddFive`/`AddTen`
+    interceptam a mesma chave; ligados os dois, o resultado é a SOMA dos dois efeitos, em ordem de
+    declaração — nenhum apaga o outro.
+    */
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct ChainSource {}
+
+    #[monjolo_macros::tasks]
+    impl ChainSource {
+        #[task]
+        fn publish(&self) {
+            offer::test__chain__value = 10.0;
+        }
+    }
+
+    #[monjolo_macros::disturbance(key = "test.chain.add_five", intercepts = "test.chain.value")]
+    struct AddFive;
+
+    impl AddFive {
+        fn disturb(&self) -> f64 {
+            self.raw() + 5.0
+        }
+    }
+
+    #[monjolo_macros::disturbance(key = "test.chain.add_ten", intercepts = "test.chain.value")]
+    struct AddTen;
+
+    impl AddTen {
+        fn disturb(&self) -> f64 {
+            self.raw() + 10.0
+        }
+    }
+
+    #[test]
+    fn two_disturbance_macros_on_the_same_key_chain_instead_of_colliding() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+
+        let (_, needed) = registry.borrow_mut().subscribe(&[], &["test.chain.value"]);
+        registry.borrow_mut().resolve().expect("chave já ofertada deveria resolver de novo sem erro");
+
+        root.evaluate();
+        assert_eq!(needed[0].get(), 10.0, "os dois desligados: valor cru");
+
+        registry.borrow().actuator("test.chain.add_five").expect("AddFive deveria estar catalogada").write(1.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 15.0, "só AddFive ligado: 10 + 5");
+
+        registry.borrow().actuator("test.chain.add_ten").expect("AddTen deveria estar catalogada").write(1.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 25.0, "os dois ligados: 10 + 5 + 10, nenhum apaga o outro");
+    }
+
+    /* Mesma prova, forma `Mixture` (`components = [...] `+ `species = ...`) — usada de verdade por
+    `tep-plant/src/disturbance/idv1.rs`. `self.raw()`/`disturb()` trocam `f64` por `Mixture<N>`;
+    resto do contrato idêntico ao teste escalar acima.
+    */
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct MixtureSource {}
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::tasks(species = MIX_SPECIES, len = 2)]
+    impl MixtureSource {
+        #[task]
+        fn publish(&self) {
+            offer::test__mix_disturbance__value::<Mixture> = crate::chemistry::Mixture::new([10.0, 20.0], &MIX_SPECIES);
+        }
+    }
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::disturbance(
+        key = "test.mix_disturbance.shift",
+        intercepts = "test.mix_disturbance.value",
+        components = ["a", "b"],
+        species = MIX_SPECIES
+    )]
+    struct MixtureShiftDisturbance;
+
+    #[cfg(feature = "chemistry")]
+    impl MixtureShiftDisturbance {
+        fn disturb(&self) -> crate::chemistry::Mixture<2> {
+            let raw = self.raw();
+            crate::chemistry::Mixture::new([raw.component(0) + 1.0, raw.component(1)], &MIX_SPECIES)
+        }
+    }
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct MixtureSink {}
+
+    #[cfg(feature = "chemistry")]
+    #[monjolo_macros::tasks(species = MIX_SPECIES, len = 2)]
+    impl MixtureSink {
+        #[task]
+        fn read_back(&self) {
+            offer::test__mix_disturbance__sink::<Mixture> = need::test__mix_disturbance__value::<Mixture>;
+        }
+    }
+
+    #[cfg(feature = "chemistry")]
+    #[test]
+    fn disturbance_macro_works_with_a_mixture_group() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+
+        let (_, needed) = registry.borrow_mut().subscribe(
+            &[],
+            &["test.mix_disturbance.sink.a", "test.mix_disturbance.sink.b"],
+        );
+        registry.borrow_mut().resolve().expect("chaves já ofertadas deveriam resolver de novo sem erro");
+
+        root.evaluate();
+        assert_eq!(needed[0].get(), 10.0, "desligado: componente a crua");
+        assert_eq!(needed[1].get(), 20.0, "desligado: componente b crua");
+
+        let command = registry
+            .borrow()
+            .actuator("test.mix_disturbance.shift")
+            .expect("MixtureShiftDisturbance deveria ter se catalogado sozinha como Actuator");
+        command.write(1.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 11.0, "ligado: componente a transformada");
+        assert_eq!(needed[1].get(), 20.0, "ligado: componente b intocada");
     }
 
     /* Prova #[need(prefix = ..., components = [...])] — forma array, usada por Flows (precisa de

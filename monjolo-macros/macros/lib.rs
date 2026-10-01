@@ -456,6 +456,216 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/** `#[disturbance(key = "...", intercepts = "...", [components = [...], species = CAMINHO])]` —
+mesmo padrão de `#[actuator]`/`#[sensor]`/`#[controller]`: struct SEM campos (`intercepts`/
+`components` já dizem tudo que ela lê; não há "command"/"state" declarados à mão porque não há
+dinâmica de 1ª ordem nenhuma aqui), um `impl` à parte com um método `disturb(&self)` escrito à mão
+em outro lugar, mesmo papel que `dynamics(&self)` tem em `#[actuator]`.
+
+`key` é a identidade do comando externo liga/desliga — vira `Actuator`, catalogado sob essa chave,
+igual qualquer outro atuador. `intercepts` é a chave (escalar) ou prefixo (com `components`, que
+também exige `species` — pra montar a `Mixture`) cujo `offer::` passa a ser TRANSFORMADO antes de
+gravar — quem publica (`offer::`) e quem consome (`need::`) continuam sem saber que isto existe
+(ver `state_registry.rs`, `Proxy::set`/`Proxy::set_group`/`register_disturbance`). Vários
+`#[disturbance]` podem `intercepts` a MESMA chave de propósito — formam uma CADEIA, aplicada em
+ordem de registro (é assim que dois distúrbios que afetam a mesma composição convivem).
+
+Getters gerados: `self.active()` (comando liga/desliga, igual `self.command()` em `#[actuator]`) e
+`self.raw()` (o valor como chegou do estágio anterior da cadeia — `f64` pra `intercepts` escalar,
+`Mixture<N>` com `components`). `disturb(&self)` devolve a MESMA forma que `raw()` devolve; nunca
+recebe parâmetro nenhum — tudo entra pelos getters, igual `dynamics(&self)`/`control(&self)` já
+fazem. Chamado só quando `active() != 0.0` — desligado, o valor passa pro próximo estágio (ou pro
+buffer) intocado, `disturb()` nem roda.
+*/
+#[proc_macro_attribute]
+pub fn disturbance(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = match parse_disturbance_args(attr) {
+        Ok(args) => args,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
+    let input = parse_macro_input!(item as ItemStruct);
+    let struct_name = &input.ident;
+    let visibility = &input.vis;
+
+    if !matches!(input.fields, Fields::Unit) {
+        return syn::Error::new_spanned(
+            &input,
+            "#[disturbance] só suporta struct sem campos (ex.: `struct Idv1;`) — o que ela lê vem \
+            inteiramente de `intercepts`/`components`, não de campos declarados à mão",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let key = &args.key;
+    let intercepted_keys: Vec<String> = match &args.components {
+        Some(components) => components.iter().map(|c| format!("{}.{}", args.intercepts, c)).collect(),
+        None => vec![args.intercepts.clone()],
+    };
+    let key_refs = quote! { &[#(#intercepted_keys),*] };
+
+    /* `__raw` guarda o valor cru só enquanto `apply()`/`disturb()` rodam — não é um Proxy, não lê
+    nada: `apply(raw)` RECEBE o valor da cadeia como parâmetro (ver `DisturbanceInterceptor`), só
+    precisa de um lugar pra `self.raw()` (getter, sem parâmetro) enxergar o mesmo valor por dentro
+    de `disturb()`. `RefCell`: `apply(&self, ...)` só empresta `&self`, mas precisa escrever aqui.
+    */
+    let (raw_field_ty, raw_field_init, raw_getter, apply_body) = match &args.components {
+        Some(components) => {
+            let len = components.len();
+            let species = args.species.as_ref().expect("checado em parse_disturbance_args");
+            (
+                quote! { ::std::cell::RefCell<[f64; #len]> },
+                quote! { ::std::cell::RefCell::new([0.0; #len]) },
+                quote! {
+                    pub fn raw(&self) -> ::monjolo::chemistry::Mixture<#len> {
+                        ::monjolo::chemistry::Mixture::<#len>::new(*self.__raw.borrow(), &#species)
+                    }
+                },
+                quote! {
+                    *self.__raw.borrow_mut() = ::std::array::from_fn(|__i| raw[__i]);
+                    self.disturb().as_array().to_vec()
+                },
+            )
+        }
+        None => (
+            quote! { ::std::cell::Cell<f64> },
+            quote! { ::std::cell::Cell::new(0.0) },
+            quote! {
+                pub fn raw(&self) -> f64 {
+                    self.__raw.get()
+                }
+            },
+            quote! {
+                self.__raw.set(raw[0]);
+                ::std::vec![self.disturb()]
+            },
+        ),
+    };
+
+    let expanded = quote! {
+        #visibility struct #struct_name {
+            __active: ::monjolo::state_registry::Proxy,
+            __raw: #raw_field_ty,
+        }
+
+        impl #struct_name {
+            pub fn active(&self) -> f64 {
+                self.__active.get()
+            }
+
+            #raw_getter
+
+            /** `new()` já registra o distúrbio no catálogo do StateRegistry (como `Actuator`, sob
+            `key`) E se inscreve como interceptador da chave que `intercepts` aponta — mesma
+            invariante de `#[actuator]`/`#[controller]`: "criado = já oferecido".
+            */
+            pub fn new(
+                registry: &mut ::monjolo::state_registry::StateRegistry,
+                _config: &::monjolo::snapshot::Snapshot,
+            ) -> ::std::rc::Rc<Self> {
+                let (__active_offered, _) = registry.subscribe(&[#key], &[]);
+                let __instance = ::std::rc::Rc::new(Self {
+                    __active: __active_offered[0].clone(),
+                    __raw: #raw_field_init,
+                });
+                registry.offer_actuator(#key, __instance.clone());
+                registry.register_disturbance(
+                    #key_refs,
+                    __instance.clone() as ::std::rc::Rc<dyn ::monjolo::state_registry::DisturbanceInterceptor>,
+                );
+                __instance
+            }
+        }
+
+        impl ::monjolo::actuator::Actuator for #struct_name {
+            fn write(&self, value: f64) {
+                self.__active.set(value);
+            }
+        }
+
+        impl ::monjolo::state_registry::DisturbanceInterceptor for #struct_name {
+            fn active(&self) -> f64 {
+                self.__active.get()
+            }
+
+            fn apply(&self, raw: &[f64]) -> ::std::vec::Vec<f64> {
+                #apply_body
+            }
+        }
+
+        /* Anúncio escondido pro bootstrap de Simulation — não é DynamicModel (não roda por tick:
+        a transformação mora dentro do `offer::` de quem publica, não num evaluate() daqui), então
+        construct() sempre devolve None, igual #[sensor] — chamar new() já cataloga tudo que
+        precisa (Actuator + interceptador), nada mais precisa acontecer aqui.
+        */
+        ::monjolo::inventory::submit! {
+            ::monjolo::ComponentDescriptor {
+                name: ::std::stringify!(#struct_name),
+                kind: ::monjolo::ComponentKind::Disturbance,
+                after: &[],
+                needs: &[],
+                offers: &[],
+                construct: |registry: &mut ::monjolo::state_registry::StateRegistry, config: &::monjolo::snapshot::Snapshot| {
+                    #struct_name::new(registry, config);
+                    ::std::option::Option::None
+                },
+            }
+        }
+    };
+
+    expanded.into()
+}
+
+struct DisturbanceArgs {
+    key: String,
+    intercepts: String,
+    components: Option<Vec<String>>,
+    species: Option<syn::Expr>,
+}
+
+fn parse_disturbance_args(attr: TokenStream) -> syn::Result<DisturbanceArgs> {
+    use syn::parse::Parser;
+    let pairs = syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated.parse(attr)?;
+
+    let mut key = None;
+    let mut intercepts = None;
+    let mut components = None;
+    let mut species = None;
+
+    for pair in &pairs {
+        if pair.path.is_ident("key") {
+            key = Some(expect_str_lit(&pair.value)?);
+        } else if pair.path.is_ident("intercepts") {
+            intercepts = Some(expect_str_lit(&pair.value)?);
+        } else if pair.path.is_ident("components") {
+            components = Some(crate::dynamic_model::expect_str_array(&pair.value)?);
+        } else if pair.path.is_ident("species") {
+            species = Some(pair.value.clone());
+        } else {
+            return Err(syn::Error::new_spanned(&pair.path, "esperado `key`, `intercepts`, `components` ou `species`"));
+        }
+    }
+
+    let key = key
+        .ok_or_else(|| syn::Error::new(proc_macro2::Span::call_site(), "falta `key = \"...\"` (identidade do comando liga/desliga)"))?;
+    let intercepts = intercepts.ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "falta `intercepts = \"...\"` (a chave, ou prefixo, que este distúrbio intercepta)",
+        )
+    })?;
+
+    if components.is_some() && species.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`components = [...]` precisa de `species = CAMINHO` junto (pra montar a Mixture)",
+        ));
+    }
+
+    Ok(DisturbanceArgs { key, intercepts, components, species })
+}
+
 fn parse_name_arg(attr: TokenStream) -> syn::Result<String> {
     let meta = syn::parse::<syn::MetaNameValue>(attr)?;
     if !meta.path.is_ident("name") {
