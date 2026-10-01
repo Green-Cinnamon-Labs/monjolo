@@ -59,9 +59,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     for item in input.items {
         match item {
             ImplItem::Fn(method) => {
-                let has_marker = method.attrs.iter().any(|a| {
-                    a.path().is_ident("need") || a.path().is_ident("offer") || a.path().is_ident("disturbance")
-                });
+                let has_old_need_offer = method.attrs.iter().any(|a| a.path().is_ident("need") || a.path().is_ident("offer"));
+                let has_disturbance = method.attrs.iter().any(|a| a.path().is_ident("disturbance"));
+                let has_marker = has_old_need_offer || has_disturbance;
                 let is_signal_task = method.attrs.iter().any(|a| a.path().is_ident("task"));
 
                 if is_signal_task {
@@ -75,6 +75,21 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .into();
                     }
                     match build_signal_task(self_ty, owner_ident, &method, &task_args) {
+                        Ok((impl_method, task_def)) => {
+                            kept_items.push(impl_method);
+                            task_defs.push(task_def);
+                        }
+                        Err(err) => return err.to_compile_error().into(),
+                    }
+                    continue;
+                }
+
+                /* `#[disturbance(...)]` SOZINHO (sem #[need]/#[offer] empilhado) é o mecanismo NOVO,
+                por interceptação — ver `build_disturbance_interceptor`. Com #[need]/#[offer] junto
+                continua sendo o mecanismo ANTIGO (`build_task`, abaixo), mantido por compatibilidade.
+                */
+                if has_disturbance && !has_old_need_offer {
+                    match build_disturbance_interceptor(self_ty, owner_ident, &method) {
                         Ok((impl_method, task_def)) => {
                             kept_items.push(impl_method);
                             task_defs.push(task_def);
@@ -504,6 +519,173 @@ fn parse_disturbance_attr(attr: &syn::Attribute) -> syn::Result<String> {
         return Err(syn::Error::new_spanned(&meta.path, "esperado `key = \"chave\"`"));
     }
     crate::dynamic_model::expect_str_lit(&meta.value)
+}
+
+/** `#[disturbance(key = "...", intercepts = "...", [components = [...]])]`, SOZINHO (sem
+`#[need]`/`#[offer]` empilhado) — o mecanismo NOVO, por interceptação (ver `state_registry.rs`,
+`StateRegistry::register_disturbance`/`Proxy::get`). `key` é a identidade do comando externo
+liga/desliga (vira um `Actuator` catalogado sob essa chave, igual ao mecanismo antigo). `intercepts`
+é a chave (escalar) ou prefixo (junto de `components`) que passa a ser lido TRANSFORMADO por
+qualquer `need::` pendente pra ela — quem oferece (`offer::`) e quem consome (`need::`) continuam
+sem saber que isto existe; a troca acontece dentro do `Proxy`, resolvida uma única vez em
+`StateRegistry::resolve()`, nunca por tick.
+
+O método marcado é uma função PURA, sem `&self`: vira um `fn` sem captura nenhuma (`transform:
+fn(f64, &[f64]) -> Vec<f64>` em `register_disturbance`), chamado de dentro de `Proxy::get()` sem
+acesso ao `StateRegistry` nem a qualquer instância — por isso não pode ler `self.campo()`. Forma
+array espera `fn(active: f64, raw: &[f64]) -> Vec<f64>`, referenciada direto. Forma escalar espera
+`fn(active: f64, raw: f64) -> f64`; a macro gera um `fn` auxiliar de 1 elemento (`Vec<f64>`/`&[f64]`
+de tamanho 1) por trás, pra sempre bater com a assinatura uniforme que `register_disturbance` exige.
+
+Não participa do grafo de `needs`/`offers` (não publica chave nova, só intercepta uma já publicada
+por outra coisa) nem tem `evaluate()` de verdade — por isso `needs`/`offers`/`after` ficam todos
+vazios no `ComponentDescriptor`, diferente de `build_task`.
+*/
+fn parse_disturbance_interceptor_attr(attr: &syn::Attribute) -> syn::Result<(String, FieldKeySpec)> {
+    let pairs = attr.parse_args_with(syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated)?;
+
+    let mut actuator_key = None;
+    let mut intercepts = None;
+    let mut components = None;
+
+    for pair in &pairs {
+        if pair.path.is_ident("key") {
+            actuator_key = Some(crate::dynamic_model::expect_str_lit(&pair.value)?);
+        } else if pair.path.is_ident("intercepts") {
+            intercepts = Some(crate::dynamic_model::expect_str_lit(&pair.value)?);
+        } else if pair.path.is_ident("components") {
+            components = Some(crate::dynamic_model::expect_str_array(&pair.value)?);
+        } else {
+            return Err(syn::Error::new_spanned(&pair.path, "esperado `key`, `intercepts` ou `components`"));
+        }
+    }
+
+    let actuator_key = actuator_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            attr,
+            "#[disturbance(...)] precisa de `key = \"...\"` (identidade do comando liga/desliga, \
+            ex.: \"disturbance.idv1\")",
+        )
+    })?;
+    let intercepts = intercepts.ok_or_else(|| {
+        syn::Error::new_spanned(
+            attr,
+            "#[disturbance(...)] precisa de `intercepts = \"...\"` (a chave, ou prefixo, que ele intercepta)",
+        )
+    })?;
+
+    let spec = match components {
+        None => FieldKeySpec::Scalar(intercepts),
+        Some(components) => FieldKeySpec::Array(intercepts, components),
+    };
+    Ok((actuator_key, spec))
+}
+
+fn build_disturbance_interceptor(
+    self_ty: &Type,
+    owner_ident: &syn::Ident,
+    method: &ImplItemFn,
+) -> syn::Result<(TokenStream2, TokenStream2)> {
+    let method_name = &method.sig.ident;
+
+    let disturbance_attrs: Vec<&syn::Attribute> = method.attrs.iter().filter(|a| a.path().is_ident("disturbance")).collect();
+    if disturbance_attrs.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "esperado exatamente um `#[disturbance(key = \"...\", intercepts = \"...\")]` neste método",
+        ));
+    }
+    let (actuator_key, spec) = parse_disturbance_interceptor_attr(disturbance_attrs[0])?;
+    let keys = spec.keys();
+    let is_array = matches!(spec, FieldKeySpec::Array(_, _));
+
+    if method.sig.inputs.iter().any(|arg| matches!(arg, syn::FnArg::Receiver(_))) {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "#[disturbance(...)] sem #[need]/#[offer] é uma função PURA — não aceita `&self` (vira \
+            um `fn` sem nenhuma captura, chamado de dentro de `Proxy::get()`, sem acesso ao \
+            `StateRegistry` nem a qualquer instância)",
+        ));
+    }
+    let param_count = method.sig.inputs.len();
+    if param_count != 2 {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            format!("esperados exatamente 2 parâmetros `(active: f64, valor(es))` — {param_count} encontrado(s)"),
+        ));
+    }
+
+    let mut impl_method = method.clone();
+    impl_method.attrs.retain(|a| !a.path().is_ident("disturbance"));
+    let impl_method_tokens = quote! { #impl_method };
+
+    let (transform_ref, shim_def) = if is_array {
+        (quote! { #self_ty::#method_name }, None)
+    } else {
+        let shim_name = format_ident!("__{}_{}_disturbance_shim", owner_ident, method_name);
+        let shim = quote! {
+            #[allow(non_snake_case)]
+            fn #shim_name(__active: f64, __raw: &[f64]) -> ::std::vec::Vec<f64> {
+                ::std::vec![#self_ty::#method_name(__active, __raw[0])]
+            }
+        };
+        (quote! { #shim_name }, Some(shim))
+    };
+
+    let interceptor_struct_name = format_ident!("__{}_{}_Disturbance", owner_ident, method_name);
+    let descriptor_name: String = format!("{}::{}", owner_ident, method_name);
+    let key_refs = quote! { &[#(#keys),*] };
+
+    let task_def = quote! {
+        #shim_def
+
+        #[allow(non_camel_case_types)]
+        struct #interceptor_struct_name {
+            __active: ::monjolo::state_registry::Proxy,
+        }
+
+        impl ::monjolo::dynamic_model::DynamicModel for #interceptor_struct_name {
+            fn name(&self) -> &str {
+                #descriptor_name
+            }
+
+            fn evaluate(&self) {
+                /* Nada a fazer por tick — a transformação mora dentro do `Proxy` de quem lê
+                (`need::`), resolvida uma única vez em `StateRegistry::resolve()`. Este componente
+                só existe pra se catalogar como `Actuator` (comando liga/desliga) e chamar
+                `register_disturbance` no `construct()` abaixo. */
+            }
+        }
+
+        impl ::monjolo::actuator::Actuator for #interceptor_struct_name {
+            fn write(&self, value: f64) {
+                self.__active.set(value);
+            }
+        }
+
+        ::monjolo::inventory::submit! {
+            ::monjolo::ComponentDescriptor {
+                name: #descriptor_name,
+                kind: ::monjolo::ComponentKind::Disturbance,
+                after: &[],
+                needs: &[],
+                offers: &[],
+                construct: |registry: &mut ::monjolo::state_registry::StateRegistry, _config: &::monjolo::snapshot::Snapshot| {
+                    let (__active_offered, _) = registry.subscribe(&[#actuator_key], &[]);
+                    let __instance = ::std::rc::Rc::new(#interceptor_struct_name {
+                        __active: __active_offered[0].clone(),
+                    });
+                    registry.offer_actuator(#actuator_key, __instance.clone());
+                    registry.register_disturbance(#key_refs, __instance.__active.clone(), #transform_ref);
+                    ::std::option::Option::Some(
+                        ::std::boxed::Box::new(__instance) as ::std::boxed::Box<dyn ::monjolo::dynamic_model::DynamicModel>
+                    )
+                },
+            }
+        }
+    };
+
+    Ok((impl_method_tokens, task_def))
 }
 
 fn self_ty_ident(self_ty: &Type) -> syn::Result<&syn::Ident> {

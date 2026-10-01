@@ -813,6 +813,95 @@ mod tests {
         assert_eq!(needed[2].get(), 4.0, "make_total lê a mistura inteira como um valor só e soma");
     }
 
+    /* Prova `#[disturbance(key = "...", intercepts = "...")]` SOZINHO (sem #[need]/#[offer]
+    empilhado) — o mecanismo NOVO, por interceptação (issue spec-tennessee-eastman#73): `InterceptSource`
+    publica uma chave comum, `InterceptSink` a lê via `need::` normal, sem saber que existe
+    distúrbio nenhum no meio, e `Interceptors::shift` (função PURA, sem `&self`) se registra contra
+    essa MESMA chave. Prova três coisas: (1) desligado, o valor passa reto; (2) ligado, o sink
+    enxerga o valor JÁ transformado, sem nenhum `after`/`need` ligando `Interceptors` a `InterceptSink`
+    — a interceptação não é um nó do grafo de dataflow, é um comportamento do `Proxy`; (3) o próprio
+    método vira o comando externo liga/desliga, catalogado como `Actuator` sob `key`.
+    */
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct InterceptSource {}
+
+    #[monjolo_macros::tasks]
+    impl InterceptSource {
+        #[task]
+        fn publish(&self) {
+            offer::test__intercept__value = 100.0;
+        }
+    }
+
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct Interceptors {}
+
+    #[monjolo_macros::tasks]
+    impl Interceptors {
+        #[disturbance(key = "test.disturbance.shift", intercepts = "test.intercept.value")]
+        fn shift(active: f64, raw: f64) -> f64 {
+            if active != 0.0 { raw + 1.0 } else { raw }
+        }
+    }
+
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct InterceptSink {}
+
+    #[monjolo_macros::tasks]
+    impl InterceptSink {
+        #[task]
+        fn read_back(&self) {
+            offer::test__intercept__sink = need::test__intercept__value;
+        }
+    }
+
+    #[test]
+    fn disturbance_interceptor_transparently_shifts_a_need_read_while_active() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+
+        let (_, needed) = registry.borrow_mut().subscribe(&[], &["test.intercept.sink"]);
+        registry.borrow_mut().resolve().expect("chave já ofertada deveria resolver de novo sem erro");
+
+        root.evaluate();
+        assert_eq!(needed[0].get(), 100.0, "desligado: InterceptSink deveria ler o valor cru, sem transformação");
+
+        let command = registry
+            .borrow()
+            .actuator("test.disturbance.shift")
+            .expect("Interceptors::shift deveria ter se catalogado sozinha como Actuator");
+        command.write(1.0);
+        root.evaluate();
+        assert_eq!(
+            needed[0].get(),
+            101.0,
+            "ligado: InterceptSink deveria ler o valor JÁ transformado, sem nenhum need/after \
+            declarado entre Interceptors e InterceptSink",
+        );
+
+        command.write(0.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 100.0, "desligado de novo: volta a ler o valor cru");
+
+        let descriptor = inventory::iter::<ComponentDescriptor>()
+            .find(|d| d.name == "Interceptors::shift")
+            .expect("a tarefa deveria ter se registrado no inventory");
+        assert_eq!(
+            descriptor.kind,
+            ComponentKind::Disturbance,
+            "deveria carimbar ComponentKind::Disturbance, não Dynamic",
+        );
+        assert!(
+            descriptor.needs.is_empty() && descriptor.offers.is_empty(),
+            "o mecanismo novo não participa do grafo de needs/offers — a troca mora no Proxy, não \
+            num evaluate() por tick",
+        );
+    }
+
     /* Prova #[need(prefix = ..., components = [...])] — forma array, usada por Flows (precisa de
     composições de 8 componentes de vários subsistemas ao mesmo tempo). Mesma mecânica de
     #[offer(...)] array, só do lado "needs" de subscribe().
