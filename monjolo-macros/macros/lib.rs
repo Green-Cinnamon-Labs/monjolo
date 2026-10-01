@@ -464,16 +464,18 @@ em outro lugar, mesmo papel que `dynamics(&self)` tem em `#[actuator]`.
 
 `key` é a identidade do comando externo liga/desliga — vira `Actuator`, catalogado sob essa chave,
 igual qualquer outro atuador. `intercepts` é a chave (escalar) ou prefixo (com `components`, que
-também exige `species` — pra montar a `Mixture`) que passa a ser lida TRANSFORMADA por qualquer
-`need::` pendente pra ela, em QUALQUER outro componente — quem publica (`offer::`) e quem consome
-continuam sem saber que isto existe (ver `state_registry.rs`, `Proxy::get`/`register_disturbance`).
+também exige `species` — pra montar a `Mixture`) cujo `offer::` passa a ser TRANSFORMADO antes de
+gravar — quem publica (`offer::`) e quem consome (`need::`) continuam sem saber que isto existe
+(ver `state_registry.rs`, `Proxy::set`/`Proxy::set_group`/`register_disturbance`). Vários
+`#[disturbance]` podem `intercepts` a MESMA chave de propósito — formam uma CADEIA, aplicada em
+ordem de registro (é assim que dois distúrbios que afetam a mesma composição convivem).
 
 Getters gerados: `self.active()` (comando liga/desliga, igual `self.command()` em `#[actuator]`) e
-`self.raw()` (o valor cru interceptado — `f64` pra `intercepts` escalar, `Mixture<N>` com
-`components`). `disturb(&self)` devolve a MESMA forma que `raw()` devolve; nunca recebe parâmetro
-nenhum — tudo entra pelos getters, igual `dynamics(&self)`/`control(&self)` já fazem. Chamado só
-quando `active() != 0.0` (ver `Proxy::get`) — desligado, o valor cru passa direto, `disturb()`
-nem roda.
+`self.raw()` (o valor como chegou do estágio anterior da cadeia — `f64` pra `intercepts` escalar,
+`Mixture<N>` com `components`). `disturb(&self)` devolve a MESMA forma que `raw()` devolve; nunca
+recebe parâmetro nenhum — tudo entra pelos getters, igual `dynamics(&self)`/`control(&self)` já
+fazem. Chamado só quando `active() != 0.0` — desligado, o valor passa pro próximo estágio (ou pro
+buffer) intocado, `disturb()` nem roda.
 */
 #[proc_macro_attribute]
 pub fn disturbance(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -503,34 +505,41 @@ pub fn disturbance(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let key_refs = quote! { &[#(#intercepted_keys),*] };
 
+    /* `__raw` guarda o valor cru só enquanto `apply()`/`disturb()` rodam — não é um Proxy, não lê
+    nada: `apply(raw)` RECEBE o valor da cadeia como parâmetro (ver `DisturbanceInterceptor`), só
+    precisa de um lugar pra `self.raw()` (getter, sem parâmetro) enxergar o mesmo valor por dentro
+    de `disturb()`. `RefCell`: `apply(&self, ...)` só empresta `&self`, mas precisa escrever aqui.
+    */
     let (raw_field_ty, raw_field_init, raw_getter, apply_body) = match &args.components {
         Some(components) => {
             let len = components.len();
             let species = args.species.as_ref().expect("checado em parse_disturbance_args");
-            let indices = 0..len;
             (
-                quote! { [::monjolo::state_registry::Proxy; #len] },
-                quote! { [#(__raw_needed[#indices].clone()),*] },
+                quote! { ::std::cell::RefCell<[f64; #len]> },
+                quote! { ::std::cell::RefCell::new([0.0; #len]) },
                 quote! {
                     pub fn raw(&self) -> ::monjolo::chemistry::Mixture<#len> {
-                        ::monjolo::chemistry::Mixture::<#len>::new(
-                            ::std::array::from_fn(|__i| self.__raw[__i].get_raw()),
-                            &#species,
-                        )
+                        ::monjolo::chemistry::Mixture::<#len>::new(*self.__raw.borrow(), &#species)
                     }
                 },
-                quote! { self.disturb().as_array().to_vec() },
+                quote! {
+                    *self.__raw.borrow_mut() = ::std::array::from_fn(|__i| raw[__i]);
+                    self.disturb().as_array().to_vec()
+                },
             )
         }
         None => (
-            quote! { ::monjolo::state_registry::Proxy },
-            quote! { __raw_needed[0].clone() },
+            quote! { ::std::cell::Cell<f64> },
+            quote! { ::std::cell::Cell::new(0.0) },
             quote! {
                 pub fn raw(&self) -> f64 {
-                    self.__raw.get_raw()
+                    self.__raw.get()
                 }
             },
-            quote! { ::std::vec![self.disturb()] },
+            quote! {
+                self.__raw.set(raw[0]);
+                ::std::vec![self.disturb()]
+            },
         ),
     };
 
@@ -542,7 +551,7 @@ pub fn disturbance(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl #struct_name {
             pub fn active(&self) -> f64 {
-                self.__active.get_raw()
+                self.__active.get()
             }
 
             #raw_getter
@@ -556,7 +565,6 @@ pub fn disturbance(attr: TokenStream, item: TokenStream) -> TokenStream {
                 _config: &::monjolo::snapshot::Snapshot,
             ) -> ::std::rc::Rc<Self> {
                 let (__active_offered, _) = registry.subscribe(&[#key], &[]);
-                let (_, __raw_needed) = registry.subscribe(&[], #key_refs);
                 let __instance = ::std::rc::Rc::new(Self {
                     __active: __active_offered[0].clone(),
                     __raw: #raw_field_init,
@@ -578,16 +586,16 @@ pub fn disturbance(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl ::monjolo::state_registry::DisturbanceInterceptor for #struct_name {
             fn active(&self) -> f64 {
-                self.__active.get_raw()
+                self.__active.get()
             }
 
-            fn apply(&self) -> ::std::vec::Vec<f64> {
+            fn apply(&self, raw: &[f64]) -> ::std::vec::Vec<f64> {
                 #apply_body
             }
         }
 
         /* Anúncio escondido pro bootstrap de Simulation — não é DynamicModel (não roda por tick:
-        a transformação mora dentro do Proxy de quem lê, não num evaluate() daqui), então
+        a transformação mora dentro do `offer::` de quem publica, não num evaluate() daqui), então
         construct() sempre devolve None, igual #[sensor] — chamar new() já cataloga tudo que
         precisa (Actuator + interceptador), nada mais precisa acontecer aqui.
         */

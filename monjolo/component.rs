@@ -902,6 +902,66 @@ mod tests {
         );
     }
 
+    /* Prova a capacidade nova da migração pro `offer::` (issue spec-tennessee-eastman#73): DOIS
+    `#[monjolo::disturbance]` registrando a MESMA chave formam uma CADEIA, não um conflito — é
+    assim que IDV(1) e IDV(2) do TEP de verdade convivem (o `teprob.f` original soma os dois
+    efeitos sobre a mesma composição). `ChainSource` publica uma vez; `AddFive`/`AddTen`
+    interceptam a mesma chave; ligados os dois, o resultado é a SOMA dos dois efeitos, em ordem de
+    declaração — nenhum apaga o outro.
+    */
+    #[monjolo_macros::dynamic_model(tasks)]
+    struct ChainSource {}
+
+    #[monjolo_macros::tasks]
+    impl ChainSource {
+        #[task]
+        fn publish(&self) {
+            offer::test__chain__value = 10.0;
+        }
+    }
+
+    #[monjolo_macros::disturbance(key = "test.chain.add_five", intercepts = "test.chain.value")]
+    struct AddFive;
+
+    impl AddFive {
+        fn disturb(&self) -> f64 {
+            self.raw() + 5.0
+        }
+    }
+
+    #[monjolo_macros::disturbance(key = "test.chain.add_ten", intercepts = "test.chain.value")]
+    struct AddTen;
+
+    impl AddTen {
+        fn disturb(&self) -> f64 {
+            self.raw() + 10.0
+        }
+    }
+
+    #[test]
+    fn two_disturbance_macros_on_the_same_key_chain_instead_of_colliding() {
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+
+        let (_, needed) = registry.borrow_mut().subscribe(&[], &["test.chain.value"]);
+        registry.borrow_mut().resolve().expect("chave já ofertada deveria resolver de novo sem erro");
+
+        root.evaluate();
+        assert_eq!(needed[0].get(), 10.0, "os dois desligados: valor cru");
+
+        registry.borrow().actuator("test.chain.add_five").expect("AddFive deveria estar catalogada").write(1.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 15.0, "só AddFive ligado: 10 + 5");
+
+        registry.borrow().actuator("test.chain.add_ten").expect("AddTen deveria estar catalogada").write(1.0);
+        root.evaluate();
+        assert_eq!(needed[0].get(), 25.0, "os dois ligados: 10 + 5 + 10, nenhum apaga o outro");
+    }
+
     /* Mesma prova, forma `Mixture` (`components = [...] `+ `species = ...`) — usada de verdade por
     `tep-plant/src/disturbance/idv1.rs`. `self.raw()`/`disturb()` trocam `f64` por `Mixture<N>`;
     resto do contrato idêntico ao teste escalar acima.

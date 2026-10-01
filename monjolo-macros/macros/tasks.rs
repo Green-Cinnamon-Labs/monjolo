@@ -295,17 +295,20 @@ impl SignalRewriter<'_> {
         }
     }
 
+    /* Escalar: `Proxy::set()` direto — já checa sozinho se há cadeia de `#[disturbance]` registrada
+    pra essa chave. Mistura: NÃO um loop de `.set()` por componente (cada chamada só veria UM
+    componente por vez — uma cadeia de distúrbio precisa ver o grupo INTEIRO do mesmo tick junto,
+    ex.: IDV(1)/(2) mexem em A e B ao mesmo tempo) — `Proxy::set_group()` recebe os `len` Proxy e os
+    `len` valores de uma vez, aplica a cadeia (se houver) sobre o grupo inteiro, só então distribui.
+    */
     fn write_expr(&self, sig: &SigUse, value: &syn::Expr) -> syn::Expr {
         let field = &sig.field;
         if !sig.is_mixture {
             syn::parse_quote!(__sig.#field.set(#value))
         } else {
-            let len = self.args.len.expect("checado em register()");
             syn::parse_quote!({
                 let __mixture = #value;
-                for __i in 0..#len {
-                    __sig.#field[__i].set(__mixture.component(__i));
-                }
+                ::monjolo::state_registry::Proxy::set_group(&__sig.#field, &__mixture.as_array());
             })
         }
     }
