@@ -14,8 +14,8 @@ aparece no `self.dynamics()` gerado, um erro comum do compilador, não de macro.
 `sensor`: mais simples — `Sensor` (sensor/model.rs) não tem computação própria do usuário, só
 key + `SensorBehavior` (Ideal/Noisy/Hysteresis, um enum fechado, não uma closure arbitrária). Por
 isso a struct anotada não precisa de campos: é só um nome pra pendurar `new()`/o `inventory::submit!`
-— sempre `Ideal` por enquanto (seleção de behavior via atributo fica pra quando isso entrar em
-escopo, ver docs/06-ruidos.md).
+— `Ideal` por padrão; `noise = <desvio padrão>` (e opcionalmente `seed = <u64>`) troca por `Noisy`
+(issue spec-tennessee-eastman#66, desvios reais em tep-plant/docs/06-ruidos.md).
 
 `dynamic_model`: o mais geral dos quatro — ver dynamic_model.rs (implementação grande o bastante
 pra merecer arquivo próprio; `#[proc_macro_attribute]` precisa ficar na raiz do crate por exigência
@@ -241,11 +241,80 @@ impl syn::parse::Parse for ActuatorArgs {
     }
 }
 
+/* `#[sensor(key = "...", noise = 0.3, seed = 7)]` — `noise` e `seed` opcionais. Sem `noise`, o
+sensor nasce `Ideal` (leitura sem transformação, exatamente o comportamento de antes desta opção
+existir). Com `noise`, nasce `Noisy::new(noise, seed)`; sem `seed`, a semente é derivada da própria
+`key` (FNV-1a, calculado aqui em tempo de compilação) — cada sensor tem ruído próprio e a rodada é
+reproduzível.
+*/
+struct SensorArgs {
+    key: String,
+    noise: Option<syn::Expr>,
+    seed: Option<syn::Expr>,
+}
+
+impl syn::parse::Parse for SensorArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let pairs = syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated(input)?;
+
+        let mut key = None;
+        let mut noise = None;
+        let mut seed = None;
+
+        for pair in &pairs {
+            if pair.path.is_ident("key") {
+                key = Some(expect_str_lit(&pair.value)?);
+            } else if pair.path.is_ident("noise") {
+                noise = Some(pair.value.clone());
+            } else if pair.path.is_ident("seed") {
+                seed = Some(pair.value.clone());
+            } else {
+                return Err(syn::Error::new_spanned(&pair.path, "esperado `key`, `noise` ou `seed`"));
+            }
+        }
+
+        let key = key.ok_or_else(|| {
+            syn::Error::new(proc_macro2::Span::call_site(), "falta `key = \"...\"`")
+        })?;
+        if seed.is_some() && noise.is_none() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`seed` só faz sentido junto com `noise`",
+            ));
+        }
+
+        Ok(SensorArgs { key, noise, seed })
+    }
+}
+
+/* FNV-1a 64 bits — semente determinística por `key`, sem depender de estado global. */
+fn seed_from_key(key: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[proc_macro_attribute]
 pub fn sensor(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let key = match parse_key_arg(attr) {
-        Ok(key) => key,
+    let SensorArgs { key, noise, seed } = match syn::parse::<SensorArgs>(attr) {
+        Ok(args) => args,
         Err(err) => return err.to_compile_error().into(),
+    };
+    let behavior = match noise {
+        None => quote! { ::monjolo::sensor::model::Ideal },
+        Some(noise) => {
+            let seed = match seed {
+                Some(seed) => quote! { (#seed) as u64 },
+                None => {
+                    let derived = seed_from_key(&key);
+                    quote! { #derived }
+                }
+            };
+            quote! { ::monjolo::sensor::model::Noisy::new((#noise) as f64, #seed) }
+        }
     };
 
     let input = parse_macro_input!(item as ItemStruct);
@@ -255,7 +324,7 @@ pub fn sensor(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !matches!(input.fields, Fields::Unit) {
         return syn::Error::new_spanned(
             &input,
-            "#[sensor] só suporta struct sem campos (ex.: `struct ReactorTemperature;`) — a leitura não tem computação própria do usuário, só key + behavior (Ideal por enquanto)",
+            "#[sensor] só suporta struct sem campos (ex.: `struct ReactorTemperature;`) — a leitura não tem computação própria do usuário, só key + behavior (Ideal, ou Noisy com `noise = ...`)",
         )
         .to_compile_error()
         .into();
@@ -267,7 +336,7 @@ pub fn sensor(attr: TokenStream, item: TokenStream) -> TokenStream {
         impl #struct_name {
             /** Devolve o mesmo `Arc<Sensor>` que o catálogo do StateRegistry guarda — "criado = já
             oferecido", mesma invariante de `sensor::model::Sensor::new()` (que este `new()` só
-            encapsula: key fixa, sempre `Ideal` por enquanto).
+            encapsula: key fixa, behavior escolhido no atributo — `Ideal` ou `Noisy`).
             */
             pub fn new(
                 registry: &mut ::monjolo::state_registry::StateRegistry,
@@ -275,7 +344,7 @@ pub fn sensor(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::monjolo::sensor::model::Sensor::new(
                     registry,
                     #key,
-                    ::std::boxed::Box::new(::monjolo::sensor::model::Ideal),
+                    ::std::boxed::Box::new(#behavior),
                 )
             }
         }
@@ -693,17 +762,5 @@ fn expect_str_lit(expr: &syn::Expr) -> syn::Result<String> {
     match expr {
         syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(literal), .. }) => Ok(literal.value()),
         other => Err(syn::Error::new_spanned(other, "esperada uma string literal")),
-    }
-}
-
-/* Parseia `key = "valve.feed_d.position"` — o único argumento que o atributo aceita por enquanto. */
-fn parse_key_arg(attr: TokenStream) -> syn::Result<String> {
-    let meta = syn::parse::<syn::MetaNameValue>(attr)?;
-    if !meta.path.is_ident("key") {
-        return Err(syn::Error::new_spanned(&meta.path, "esperado `key = \"...\"`"));
-    }
-    match &meta.value {
-        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(literal), .. }) => Ok(literal.value()),
-        other => Err(syn::Error::new_spanned(other, "`key` precisa ser uma string literal")),
     }
 }
