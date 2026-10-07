@@ -42,7 +42,7 @@ Separating these two things had two motivations:
 
 **It is not:**
 - A Tennessee Eastman simulator — that's `tep-plant`, which consumes this crate.
-- A control framework — there's no notion of controller/loop here; that's the responsibility of whoever builds the model (or of a supervisory repository, like `tep-operator`).
+- A control framework — there's no notion of controller/loop here; that's the responsibility of whoever builds the model (or of a supervisory repository, like `plant-supervisor`).
 
 ---
 
