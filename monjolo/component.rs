@@ -389,6 +389,72 @@ mod tests {
         root.evaluate(); // avalia a árvore inteira, inclusive control() (lê sensor, escreve atuador) — sem panic
     }
 
+    /* Controller com `#[state]` (ex.: a integral de um PI) — mesmas chaves de sensor/atuador do
+    TestController acima, porque `inventory` anexa todo controller do binário de teste em todo
+    `attach_discovered_components()`. `control()` devolve uma derivada constante: depois de N passos
+    o Integrator tem de ter somado exatamente N·dt·c, e o estado tem de ter nascido em 0.0.
+    */
+    const STATEFUL_DERIVATIVE: f64 = 2.0;
+
+    #[monjolo_macros::controller(name = "test_stateful_controller")]
+    struct StatefulController {
+        #[sensor(key = "test.discovered.position")]
+        reading: f64,
+        #[actuator(key = "test.discovered.position")]
+        position: f64,
+        #[state(key = "test.stateful.integral")]
+        integral: f64,
+    }
+
+    impl StatefulController {
+        fn control(&self) -> f64 {
+            STATEFUL_DERIVATIVE
+        }
+    }
+
+    #[test]
+    fn controller_state_is_integrated_by_the_integrator() {
+        use crate::numerical_method::integrator::Integrator;
+        use crate::numerical_method::rk4::RK4;
+
+        let registry = StateRegistry::shared();
+        let mut root = Composite::new();
+        let config = Snapshot::from_pairs(&[]);
+
+        attach_discovered_components(&mut root, &mut registry.borrow_mut(), &config);
+        assert!(
+            root.state_keys().contains(&"test.stateful.integral".to_string()),
+            "state_keys() deveria incluir o #[state] do controller: {:?}",
+            root.state_keys(),
+        );
+
+        /* Mesmo pareamento (estado, derivada) que `Simulation::run()` faz para o Integrator. */
+        let (_, proxies) = registry
+            .borrow_mut()
+            .subscribe(&[], &["test.stateful.integral", "test.stateful.integral.derivative"]);
+        registry.borrow_mut().resolve().expect("todo input deveria ter provedor");
+        let (state, derivative) = (&proxies[0], &proxies[1]);
+        assert_eq!(state.get(), 0.0, "o #[state] de controller nasce em 0.0");
+
+        let dt = 0.1;
+        let steps = 10;
+        for _ in 0..steps {
+            let next = RK4.step(&[state.get()], dt, &mut |perturbed: &[f64]| {
+                state.set(perturbed[0]);
+                root.evaluate();
+                vec![derivative.get()]
+            });
+            state.set(next[0]);
+        }
+
+        let expected = steps as f64 * dt * STATEFUL_DERIVATIVE;
+        assert!(
+            (state.get() - expected).abs() < 1e-12,
+            "esperava N·dt·c = {expected}, ficou {}",
+            state.get(),
+        );
+    }
+
     /* Prova o mecanismo mais geral: campo escalar (#[state]+#[config]+#[offer]), campo array
     (idem, 3 elementos), campo #[offer]-só com setter (escrito de dentro de evaluate()) e campo
     comum (Default::default(), sem Proxy nenhum) — mesma combinação real usada depois em

@@ -414,17 +414,31 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut sensor_keys = Vec::new();
     let mut actuator_idents = Vec::new();
     let mut actuator_keys = Vec::new();
+    let mut state: Option<(syn::Ident, String)> = None;
 
     for field in named_fields {
         let ident = field.ident.as_ref().expect("Fields::Named sempre tem ident");
         let mut marked = false;
         for field_attr in &field.attrs {
-            if field_attr.path().is_ident("sensor") {
-                if marked {
-                    return syn::Error::new_spanned(field_attr, "um campo só pode ser #[sensor] OU #[actuator], não os dois")
+            let is_marker = ["sensor", "actuator", "state"].iter().any(|m| field_attr.path().is_ident(m));
+            if is_marker && marked {
+                return syn::Error::new_spanned(field_attr, "um campo só pode ser #[sensor], #[actuator] OU #[state], um só")
+                    .to_compile_error()
+                    .into();
+            }
+            if field_attr.path().is_ident("state") {
+                if state.is_some() {
+                    return syn::Error::new_spanned(field_attr, "só pode haver um campo #[state] por controller")
                         .to_compile_error()
                         .into();
                 }
+                let key = match parse_field_key(field_attr) {
+                    Ok(key) => key,
+                    Err(err) => return err.to_compile_error().into(),
+                };
+                state = Some((ident.clone(), key));
+                marked = true;
+            } else if field_attr.path().is_ident("sensor") {
                 let key = match parse_field_key(field_attr) {
                     Ok(key) => key,
                     Err(err) => return err.to_compile_error().into(),
@@ -433,11 +447,6 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
                 sensor_keys.push(key);
                 marked = true;
             } else if field_attr.path().is_ident("actuator") {
-                if marked {
-                    return syn::Error::new_spanned(field_attr, "um campo só pode ser #[sensor] OU #[actuator], não os dois")
-                        .to_compile_error()
-                        .into();
-                }
                 let key = match parse_field_key(field_attr) {
                     Ok(key) => key,
                     Err(err) => return err.to_compile_error().into(),
@@ -460,10 +469,52 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
             .into();
     }
 
+    /* `#[state(key = "...")]` opcional, no máximo um: estado integrável do próprio controller (ex.:
+    a integral de um PI). Mesmo padrão do `#[state]` de `#[actuator]` — oferta `K` e
+    `K.derivative`, getter que lê o estado e `state_keys()` para o Integrator enxergá-lo. Não pode
+    ser um acumulador mutado dentro de `control()`: o RK4 chama `evaluate()` várias vezes por tick,
+    em sub-passos hipotéticos. Por isso, com `#[state]`, `control()` devolve `f64` = dK/dt (mesma
+    convenção de `dynamics()` em `#[actuator]`) e é o Integrator quem soma. O estado nasce em 0.0.
+    Sem `#[state]`, `control()` continua devolvendo `()` e nada muda.
+    */
+    let (state_struct_field, state_getter, state_new, state_init, evaluate_body, state_keys_fn) = match &state {
+        Some((state_ident, state_key)) => (
+            quote! {
+                #state_ident: ::monjolo::state_registry::Proxy,
+                __derivative: ::monjolo::state_registry::Proxy,
+            },
+            quote! {
+                pub fn #state_ident(&self) -> f64 {
+                    self.#state_ident.get()
+                }
+            },
+            quote! {
+                let __derivative_key = ::std::format!("{}.derivative", #state_key);
+                let (__offered, _) = registry.subscribe(&[#state_key, &__derivative_key], &[]);
+                __offered[0].set(0.0);
+            },
+            quote! {
+                #state_ident: __offered[0].clone(),
+                __derivative: __offered[1].clone(),
+            },
+            quote! {
+                let __derivative: f64 = self.control();
+                self.__derivative.set(__derivative);
+            },
+            quote! {
+                fn state_keys(&self) -> ::std::vec::Vec<::std::string::String> {
+                    ::std::vec![#state_key.to_string()]
+                }
+            },
+        ),
+        None => (quote! {}, quote! {}, quote! {}, quote! {}, quote! { self.control(); }, quote! {}),
+    };
+
     let expanded = quote! {
         #visibility struct #struct_name {
             #(#sensor_idents: ::monjolo::state_registry::SensorHandle,)*
             #(#actuator_idents: ::monjolo::state_registry::ActuatorHandle,)*
+            #state_struct_field
         }
 
         impl #struct_name {
@@ -477,6 +528,7 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
                     self.#actuator_idents.actuator()
                 }
             )*
+            #state_getter
 
             /** `new()` já registra o controller no catálogo do StateRegistry sob `name` — mesma
             invariante de `controller::model::Controller::new()` ("criado = já oferecido").
@@ -484,9 +536,11 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn new(registry: &mut ::monjolo::state_registry::StateRegistry) -> ::std::rc::Rc<Self> {
                 #(let #sensor_idents = registry.need_sensor(#sensor_keys);)*
                 #(let #actuator_idents = registry.need_actuator(#actuator_keys);)*
+                #state_new
                 let __instance = ::std::rc::Rc::new(Self {
                     #(#sensor_idents,)*
                     #(#actuator_idents,)*
+                    #state_init
                 });
                 registry.offer_controller(#name, __instance.clone());
                 __instance
@@ -495,8 +549,10 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl ::monjolo::dynamic_model::DynamicModel for #struct_name {
             fn evaluate(&self) {
-                self.control();
+                #evaluate_body
             }
+
+            #state_keys_fn
         }
 
         impl ::monjolo::controller::Controller for #struct_name {}

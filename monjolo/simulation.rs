@@ -562,18 +562,23 @@ impl Simulation {
                             derivadas) e devolve as derivadas resultantes.
                             */
                             let next =
-                                integrator.step(&current, dt_hours, &mut |perturbed: &[f64]| {
-                                    for (proxy, &value) in state_proxies.iter().zip(perturbed) {
-                                        proxy.set(value);
-                                    }
-                                    model.evaluate();
-                                    derivative_proxies.iter().map(Proxy::get).collect()
-                                });
+                                integrator.step(
+                                    &current, 
+                                    dt_hours, 
+                                    &mut |perturbed: &[f64]| // integrador passa uma lista de estados (que ele provavelmente alterou)
+                                    {
+                                        for (proxy, &value) in state_proxies.iter().zip(perturbed) {
+                                            proxy.set(value); // proxy.set() precisa dos valores pareados.
+                                        }
+                                        model.evaluate(); // passamos para as tasks avaliarem as derivadas na ordem topológica definida
+                                        derivative_proxies.iter().map(Proxy::get).collect() // novo estado retornado para o integrador
+                                }
+                            );
 
-                            /* O último evaluate() acima rodou sobre s4 (um sub-passo hipotético do
-                            RK4, não o estado final combinado) — escreve o estado de verdade e
-                            reavalia mais uma vez pra EvaluationState refletir o que vai ser
-                            commitado, não o resíduo do último k4.
+                            /* O último evaluate() acima rodou sobre um provável sub-passo hipotético
+                            do Integrador (ex.: RK4 seria o s4), não o estado final combinado. Então, 
+                            precisamos escrever o estado de verdade e reavalia mais uma vez pra 
+                            EvaluationState refletir o que vai ser commitado.
                             */
                             for (proxy, &value) in state_proxies.iter().zip(&next) {
                                 proxy.set(value);
