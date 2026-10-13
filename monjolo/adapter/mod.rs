@@ -22,3 +22,6 @@ o canal de comandos sem intermediário.
 
 #[cfg(feature = "opcua")]
 pub mod opcua;
+
+#[cfg(feature = "function")]
+pub mod function;

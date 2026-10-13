@@ -43,6 +43,44 @@ da máquina) — não dá pra ter os dois com essa constante sozinha hoje.
 #[cfg(feature = "opcua")]
 const DEFAULT_OPCUA_ENDPOINT: &str = "opc.tcp://127.0.0.1:4840/tep/server/";
 
+/* Onde o adaptador de função (`adapter/function.rs`) escuta quando `[monjolo.function].endpoint` não
+diz outra coisa. `127.0.0.1`: só a própria máquina alcança — pra servir de dentro de um container é
+preciso configurar `0.0.0.0:porta`.
+*/
+#[cfg(feature = "function")]
+const DEFAULT_FUNCTION_ENDPOINT: &str = "127.0.0.1:8091";
+
+/* Variáveis de ambiente que têm precedência sobre `application.toml` — pra mesma imagem (mesmo
+binário, mesmo arquivo) subir num modo ou no outro sem editar arquivo nenhum.
+*/
+const MODE_ENV: &str = "MONJOLO_MODE";
+#[cfg(feature = "function")]
+const FUNCTION_ENDPOINT_ENV: &str = "MONJOLO_FUNCTION_ENDPOINT";
+
+/** O que `bootstrap()` sobe (`[monjolo].mode` em `application.toml`, ou `MONJOLO_MODE`).
+`Simulation` é o de sempre: a Thread da planta integrando no tempo, com o adaptador OPC-UA se a
+feature estiver ligada. `Function` não integra nada: monta o modelo uma vez e o serve como função
+por HTTP (spec-tennessee-eastman#94) — sem Thread da planta e sem OPC-UA.
+*/
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Mode {
+    #[default]
+    Simulation,
+    Function,
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "simulation" => Ok(Mode::Simulation),
+            "function" => Ok(Mode::Function),
+            other => Err(format!("modo desconhecido: '{other}' (esperava \"simulation\" ou \"function\")")),
+        }
+    }
+}
+
 /** Configurações de framework lidas de `[monjolo]` dentro de `application.toml` — deliberadamente
 separado de `Snapshot` (`snapshot.rs`), que só entende `f64` e ignora todo o resto. Mesmo arquivo,
 duas leituras independentes: `Snapshot` cuida da condição inicial física (`[state.*]`), isto aqui
@@ -51,9 +89,12 @@ cuida de configuração de orquestração (`[monjolo]`) — a mesma separação 
 */
 #[derive(Debug)]
 struct BootstrapSettings {
+    mode: Mode,
     numerical_method: NumericalMethod,
     #[cfg(feature = "opcua")]
     opcua_endpoint: String,
+    #[cfg(feature = "function")]
+    function_endpoint: String,
 }
 
 impl BootstrapSettings {
@@ -64,6 +105,23 @@ impl BootstrapSettings {
     e "configurado errado" importa.
     */
     fn load(path: &str) -> Result<Self, String> {
+        let mode_override = std::env::var(MODE_ENV).ok();
+        #[cfg(feature = "function")]
+        let endpoint_override = std::env::var(FUNCTION_ENDPOINT_ENV).ok();
+        #[cfg(not(feature = "function"))]
+        let endpoint_override: Option<String> = None;
+        Self::parse(path, mode_override.as_deref(), endpoint_override.as_deref())
+    }
+
+    /* Separado de `load()` só pra dar pra testar a precedência sem mexer em variável de ambiente
+    (compartilhada entre testes que rodam em paralelo): `mode_override`/`function_endpoint_override`
+    são o que `load()` leu do ambiente.
+    */
+    fn parse(
+        path: &str,
+        mode_override: Option<&str>,
+        function_endpoint_override: Option<&str>,
+    ) -> Result<Self, String> {
         let root: Option<toml::Value> = match std::fs::read_to_string(path) {
             Ok(content) => Some(
                 toml::from_str(&content)
@@ -73,6 +131,11 @@ impl BootstrapSettings {
         };
 
         let monjolo_table = root.as_ref().and_then(|r| r.get("monjolo"));
+
+        let mode = match mode_override.or_else(|| monjolo_table.and_then(|m| m.get("mode")).and_then(|v| v.as_str())) {
+            Some(raw) => raw.parse().map_err(|e| format!("bootstrap: {e}"))?,
+            None => Mode::default(),
+        };
 
         let numerical_method = match monjolo_table
             .and_then(|m| m.get("numerical_method"))
@@ -90,10 +153,26 @@ impl BootstrapSettings {
             .unwrap_or(DEFAULT_OPCUA_ENDPOINT)
             .to_string();
 
+        #[cfg(feature = "function")]
+        let function_endpoint = function_endpoint_override
+            .or_else(|| {
+                monjolo_table
+                    .and_then(|m| m.get("function"))
+                    .and_then(|f| f.get("endpoint"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or(DEFAULT_FUNCTION_ENDPOINT)
+            .to_string();
+        #[cfg(not(feature = "function"))]
+        let _ = function_endpoint_override;
+
         Ok(Self {
+            mode,
             numerical_method,
             #[cfg(feature = "opcua")]
             opcua_endpoint,
+            #[cfg(feature = "function")]
+            function_endpoint,
         })
     }
 }
@@ -251,12 +330,34 @@ impl Runtime {
 
     `main()` de uma aplicação real fica só: `Runtime::bootstrap().expect(...).run();`
     */
-    pub fn bootstrap() -> Result<Arc<Self>, String> {
+    pub fn bootstrap() -> Result<Application, String> {
         if let Err(err) = std::fs::write(EXECUTION_ORDER_PATH, crate::component::describe_phase_a_execution_order()) {
             eprintln!("[bootstrap] não consegui escrever {EXECUTION_ORDER_PATH}: {err}");
         }
 
         let settings = BootstrapSettings::load(CONFIG_PATH)?;
+
+        if settings.mode == Mode::Function {
+            #[cfg(feature = "function")]
+            {
+                let config = crate::snapshot::Snapshot::from_file(CONFIG_PATH)?;
+                let function = crate::model_function::ModelFunction::discovered(&config)?;
+                let server = crate::adapter::function::FunctionServer::bind(&settings.function_endpoint)?;
+                eprintln!(
+                    "[function] servindo {} chave(s), {} estado(s), em http://{}",
+                    function.keys().len(),
+                    function.state_keys().len(),
+                    server.local_address(),
+                );
+                return Ok(Application::Function { server, function });
+            }
+            #[cfg(not(feature = "function"))]
+            return Err(
+                "bootstrap: modo \"function\" pedido, mas este binário foi compilado sem a feature `function`"
+                    .to_string(),
+            );
+        }
+
         let numerical_method = settings.numerical_method;
 
         let runtime = Runtime::new(move || {
@@ -269,7 +370,7 @@ impl Runtime {
         #[cfg(feature = "opcua")]
         runtime.spawn_opcua_adapter(settings.opcua_endpoint);
 
-        Ok(runtime)
+        Ok(Application::Simulation(runtime))
     }
 
     /** Bloqueia pelo resto da vida do processo, do jeito certo pra cada configuração de feature —
@@ -285,6 +386,33 @@ impl Runtime {
         #[cfg(not(feature = "opcua"))]
         loop {
             std::thread::park();
+        }
+    }
+}
+
+/** O que `Runtime::bootstrap()` devolve: a aplicação já decidida pela configuração (`Mode`), pronta
+pra `run()` — `main()` não precisa saber qual das duas subiu. `Function` guarda o modelo junto do
+servidor porque `ModelFunction` é `Rc`-based (`!Send`): quem chama `run()` tem que ser a mesma thread
+que chamou `bootstrap()`, que é exatamente o que um `main()` faz.
+*/
+pub enum Application {
+    Simulation(Arc<Runtime>),
+    #[cfg(feature = "function")]
+    Function {
+        server: crate::adapter::function::FunctionServer,
+        function: crate::model_function::ModelFunction,
+    },
+}
+
+impl Application {
+    /** Bloqueia pelo resto da vida do processo — `Runtime::run()` no modo simulação, o laço do
+    servidor no modo função.
+    */
+    pub fn run(&self) {
+        match self {
+            Application::Simulation(runtime) => runtime.run(),
+            #[cfg(feature = "function")]
+            Application::Function { server, function } => server.serve(function),
         }
     }
 }
@@ -369,6 +497,56 @@ mod tests {
         let settings =
             BootstrapSettings::load(file.path_str()).expect("TOML válido não deveria falhar");
         assert!(matches!(settings.numerical_method, NumericalMethod::RK4));
+    }
+
+    #[test]
+    fn bootstrap_settings_mode_defaults_to_simulation_and_reads_function_from_monjolo_table() {
+        let absent = TempTomlFile::new("monjolo_bootstrap_test_mode_absent.toml", "[monjolo]\nnumerical_method = \"rk4\"\n");
+        let settings = BootstrapSettings::parse(absent.path_str(), None, None).expect("TOML válido");
+        assert_eq!(settings.mode, Mode::Simulation);
+
+        let function = TempTomlFile::new("monjolo_bootstrap_test_mode_function.toml", "[monjolo]\nmode = \"function\"\n");
+        let settings = BootstrapSettings::parse(function.path_str(), None, None).expect("TOML válido");
+        assert_eq!(settings.mode, Mode::Function);
+    }
+
+    /* O que veio do ambiente (`MONJOLO_MODE`) ganha do arquivo — nos dois sentidos. */
+    #[test]
+    fn bootstrap_settings_mode_override_wins_over_the_file() {
+        let file = TempTomlFile::new("monjolo_bootstrap_test_mode_override.toml", "[monjolo]\nmode = \"simulation\"\n");
+
+        let settings = BootstrapSettings::parse(file.path_str(), Some("function"), None).expect("TOML válido");
+        assert_eq!(settings.mode, Mode::Function);
+
+        let file = TempTomlFile::new("monjolo_bootstrap_test_mode_override_back.toml", "[monjolo]\nmode = \"function\"\n");
+        let settings = BootstrapSettings::parse(file.path_str(), Some("Simulation"), None).expect("TOML válido");
+        assert_eq!(settings.mode, Mode::Simulation);
+    }
+
+    #[test]
+    fn bootstrap_settings_errors_on_unknown_mode() {
+        let file = TempTomlFile::new("monjolo_bootstrap_test_bad_mode.toml", "[monjolo]\nmode = \"batch\"\n");
+        let err = BootstrapSettings::parse(file.path_str(), None, None)
+            .expect_err("modo desconhecido deveria ser erro fatal, não um default silencioso");
+        assert!(err.contains("batch"), "mensagem de erro deveria citar o valor inválido: {err}");
+    }
+
+    #[cfg(feature = "function")]
+    #[test]
+    fn bootstrap_settings_function_endpoint_comes_from_override_then_file_then_default() {
+        let file = TempTomlFile::new(
+            "monjolo_bootstrap_test_function_endpoint.toml",
+            "[monjolo.function]\nendpoint = \"0.0.0.0:9000\"\n",
+        );
+        let settings = BootstrapSettings::parse(file.path_str(), None, Some("127.0.0.1:7000")).expect("TOML válido");
+        assert_eq!(settings.function_endpoint, "127.0.0.1:7000");
+
+        let settings = BootstrapSettings::parse(file.path_str(), None, None).expect("TOML válido");
+        assert_eq!(settings.function_endpoint, "0.0.0.0:9000");
+
+        let absent = TempTomlFile::new("monjolo_bootstrap_test_function_endpoint_default.toml", "[monjolo]\n");
+        let settings = BootstrapSettings::parse(absent.path_str(), None, None).expect("TOML válido");
+        assert_eq!(settings.function_endpoint, DEFAULT_FUNCTION_ENDPOINT);
     }
 
     #[test]
