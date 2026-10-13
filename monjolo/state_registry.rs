@@ -476,6 +476,14 @@ impl StateRegistry {
         (offered, requested)
     }
 
+    /* Nomes de todas as chaves já oferecidas em `subscribe()` — descoberta, pra quem (ex.:
+    `model_function::ModelFunction`) precisa listar o que existe sem conhecer os nomes de antemão.
+    Sem ordem garantida (`HashMap`).
+    */
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.index.keys().map(String::as_str)
+    }
+
     /** Mesma ideia de `subscribe()`, pro lado `ReadProxy`/`CurrentState`: `Sensor` só tem `needs`,
     nunca `offers` — ninguém oferece um `ReadProxy`, só pede. Resolvido contra o mesmo `index:
     HashMap<String, usize>` que os `offers` de `subscribe()` já preenchem — um único namespace de
