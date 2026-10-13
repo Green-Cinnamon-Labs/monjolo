@@ -19,6 +19,11 @@ rand_distr = "0.4"
 toml = "0.8"
 opcua = { package = "async-opcua", version = "0.18", features = ["server", "client"], optional = true }
 tokio = { version = "1", features = ["rt", "time"], optional = true }
+tiny_http = { version = "0.12", optional = true }
+# `float_roundtrip`: o número que chega por JSON precisa virar exatamente o mesmo f64 que o cliente
+# mandou — sem isso o parser pode errar o último bit, e a função servida deixaria de ser idêntica à
+# função chamada dentro do processo.
+serde_json = { version = "1", features = ["float_roundtrip"], optional = true }
 # proc-macro = true não pode dividir crate com código normal — monjolo-macros mora ao lado, monjolo
 # reexporta as macros através de si mesmo (ver monjolo-macros/Cargo.toml).
 monjolo-macros = { path = "monjolo-macros" }
@@ -33,6 +38,10 @@ inventory = "0.3"
 # demais pra serem dependência default de um framework de simulação
 # genérico. O resto do crate não sabe nada disso.
 opcua = ["dep:opcua", "dep:tokio"]
+
+# Adaptador de função (adapter::function) — serve o StateRegistry por HTTP, pra quem quer avaliar o
+# modelo num ponto de fora do processo (spec-tennessee-eastman#94). Servidor síncrono, sem tokio.
+function = ["dep:tiny_http", "dep:serde_json"]
 
 # Correlações termodinâmicas de mistura (monjolo::chemistry — entalpia, Antoine, densidade
 # líquida, Newton-Raphson) — matemática genérica, sem dependência externa nenhuma, mas ainda
