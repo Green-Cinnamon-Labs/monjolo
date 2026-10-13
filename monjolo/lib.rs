@@ -16,6 +16,7 @@ pub mod component;
 pub mod controller;
 pub mod disturbance;
 pub mod dynamic_model;
+pub mod model_function;
 pub mod numerical_method;
 pub mod runtime;
 pub mod runtime_control;
@@ -33,8 +34,8 @@ que ele existe.
 pub use monjolo_macros::{actuator, controller, disturbance, dynamic_model, sensor, tasks};
 
 pub use component::{
-    attach_discovered_components, describe_phase_a_execution_order, phase_a_execution_order,
-    ComponentDescriptor, ComponentKind,
+    attach_discovered_components, attach_discovered_components_where,
+    describe_phase_a_execution_order, phase_a_execution_order, ComponentDescriptor, ComponentKind,
 };
 
 /* Reexportado por inteiro (não só `submit!`/`collect!`/`iter`): o código que `#[actuator(...)]`

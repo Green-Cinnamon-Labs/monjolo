@@ -133,12 +133,29 @@ exige rodar a MESMA descoberta que `Simulation::run()` roda, sem precisar subir 
 só pra isso (ver `component::tests` aqui mesmo, que já usa isto diretamente).
 */
 pub fn attach_discovered_components(root: &mut Composite, registry: &mut StateRegistry, config: &Snapshot) {
+    attach_discovered_components_where(root, registry, config, |_| true);
+}
+
+/** Mesma descoberta de `attach_discovered_components`, deixando de fora todo componente cujo
+`kind` `include` rejeita — nem `construct()` roda pra ele, então ele não se cataloga nem declara
+`need` nenhum. Existe pra `model_function::ModelFunction` (spec-tennessee-eastman#92), que avalia
+só a física: sem `Controller` e sem `Sensor`.
+*/
+pub fn attach_discovered_components_where(
+    root: &mut Composite,
+    registry: &mut StateRegistry,
+    config: &Snapshot,
+    include: impl Fn(ComponentKind) -> bool,
+) {
     let mut phase_a: Vec<&'static ComponentDescriptor> = Vec::new();
     let mut phase_b: Vec<&'static ComponentDescriptor> = Vec::new();
     let mut phase_c: Vec<&'static ComponentDescriptor> = Vec::new();
     let mut sensors: Vec<&'static ComponentDescriptor> = Vec::new();
 
     for descriptor in inventory::iter::<ComponentDescriptor> {
+        if !include(descriptor.kind) {
+            continue;
+        }
         match descriptor.kind {
             ComponentKind::Dynamic | ComponentKind::Disturbance => phase_a.push(descriptor),
             ComponentKind::Actuator => phase_b.push(descriptor),
