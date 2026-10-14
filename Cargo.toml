@@ -55,3 +55,9 @@ chemistry = []
 [[example]]
 name = "opcua_browse"
 required-features = ["opcua"]
+
+# Mesmo motivo do exemplo acima: tests/adapter_function.rs usa monjolo::adapter::function e
+# serde_json, que só existem com a feature `function` ligada.
+[[test]]
+name = "adapter_function"
+required-features = ["function"]
