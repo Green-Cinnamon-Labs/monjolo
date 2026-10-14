@@ -1,0 +1,63 @@
+# Runtime — o supervisor persistente e o bootstrap por convenção
+
+`monjolo::runtime` (`monjolo/runtime.rs`) é o supervisor persistente da issue #67, com o desenho completo em `spec-tennessee-eastman/docs/issue61_runtime_supervisor/nota_runtime_supervisor.md`. `Simulation` (`simulation.rs`) é o builder/runner de UMA física, do início até alguém pedir pra parar; `Runtime` é quem vive o processo inteiro, é dono do adaptador de rede (hoje só OPC-UA) pelo tempo de vida inteiro dele, e troca atomicamente pra qual `Simulation` o adaptador aponta a cada `reset()` — o adaptador, a conexão TCP de um cliente conectado e a estrutura de nodes nunca caem.
+
+Analogia usada na nota: é o mesmo movimento que fechar e dar `refresh()` num `ApplicationContext` do Spring — o grafo de objetos inteiro (StateRegistry, Sensor/Actuator/Controller) é jogado fora e reconstruído do zero a cada reset, nunca remendado no lugar.
+
+## Convenções fixas
+
+- **`application.toml`** (`CONFIG_PATH`, issue #68) — sempre na raiz do projeto (o diretório de trabalho no momento em que o binário roda), nunca um caminho passado por quem monta a aplicação. Mesmo papel de `application.properties`/`.yml` na raiz do classpath no Spring: a APLICAÇÃO não escolhe onde procurar, só o CONTEÚDO é dela.
+- **`execution_order.txt`** (`EXECUTION_ORDER_PATH`, issue spec-tennessee-eastman#71) — onde `bootstrap()` escreve o artefato de diagnóstico de `describe_phase_a_execution_order()`. Mesma convenção: raiz do projeto, sempre esse nome, nunca configurável. Não é um artefato que a aplicação personaliza, é sempre o mesmo debug.
+
+## Endereços padrão
+
+- **OPC-UA: `opc.tcp://127.0.0.1:4840/tep/server/`** (`DEFAULT_OPCUA_ENDPOINT`). A porta é a IANA padrão de OPC-UA. O host é `127.0.0.1`, não `0.0.0.0`, de propósito: o async-opcua-server não distingue "endereço de bind" de "endereço anunciado" (`ServerInfo::base_endpoint()`, em `async-opcua-server/src/info.rs`, monta o EndpointUrl que o servidor devolve em GetEndpoints/FindServers a partir do MESMO `tcp_config.host` do bind). Com `0.0.0.0`, o servidor aceita conexão em qualquer interface, mas anuncia a si mesmo como `opc.tcp://0.0.0.0:...`, um endereço que nenhum cliente consegue discar de verdade — quebra qualquer client que confie no EndpointUrl reportado pra reconectar (ex.: UaExpert), mesmo que a conexão inicial/manual funcione. Se um dia isso precisar ser alcançável de outra máquina na rede, precisa virar configurável (bind em `0.0.0.0`, anunciar o IP real da máquina) — não dá pra ter os dois com essa constante sozinha hoje.
+- **Função: `127.0.0.1:8091`** (`DEFAULT_FUNCTION_ENDPOINT`) — onde o adaptador de função (`adapter/function.rs`) escuta quando `[monjolo.function].endpoint` não diz outra coisa. `127.0.0.1`: só a própria máquina alcança — pra servir de dentro de um container é preciso configurar `0.0.0.0:porta`.
+
+## Configuração
+
+`BootstrapSettings` guarda as configurações de framework lidas de `[monjolo]` dentro de `application.toml` — deliberadamente separado de `Snapshot` (`snapshot.rs`), que só entende `f64` e ignora todo o resto. Mesmo arquivo, duas leituras independentes: `Snapshot` cuida da condição inicial física (`[state.*]`), `BootstrapSettings` cuida de configuração de orquestração (`[monjolo]`) — a mesma separação que `[meta]` já demonstra (tabela não-numérica que `Snapshot` sempre ignorou, sem problema nenhum).
+
+| Chave | O que define | Padrão |
+|---|---|---|
+| `[monjolo].mode` | O que `bootstrap()` sobe: `"simulation"` ou `"function"` | `"simulation"` |
+| `[monjolo].numerical_method` | O método de integração | `"rk4"` |
+| `[monjolo.opcua].endpoint` | Endereço do adaptador OPC-UA (feature `opcua`) | `opc.tcp://127.0.0.1:4840/tep/server/` |
+| `[monjolo.function].endpoint` | Endereço do adaptador de função (feature `function`) | `127.0.0.1:8091` |
+
+Arquivo ausente não é erro fatal — cai pros defaults de framework, mesmo espírito de `application.properties` ser opcional no Spring (a app roda com default se ele não existir). Arquivo PRESENTE mas malformado, ou com uma chave reconhecida mas de valor inválido (ex.: `numerical_method = "euler"`, que não existe), É erro fatal — a diferença entre "não configurado" e "configurado errado" importa.
+
+### O modo
+
+`Mode` é o que `bootstrap()` sobe. `Simulation` é o de sempre: a Thread da planta integrando no tempo, com o adaptador OPC-UA se a feature estiver ligada. `Function` não integra nada: monta o modelo uma vez e o serve como função por HTTP (spec-tennessee-eastman#94) — sem Thread da planta e sem OPC-UA.
+
+### Variáveis de ambiente
+
+Duas variáveis têm precedência sobre `application.toml`, pra mesma imagem (mesmo binário, mesmo arquivo) subir num modo ou no outro sem editar arquivo nenhum:
+
+- **`MONJOLO_MODE`** — ganha de `[monjolo].mode`.
+- **`MONJOLO_FUNCTION_ENDPOINT`** — ganha de `[monjolo.function].endpoint` (feature `function`).
+
+## A fábrica de `Simulation`
+
+`SimulationFactory` é a fábrica de uma `Simulation` nova — chamada uma vez no boot do `Runtime` e de novo a cada `reset()`. Precisa ser `Fn`, não `FnOnce`: cada chamada tem que produzir uma `Simulation` igualmente válida, sem depender de nada "gasto" na primeira vez. Na prática isso nunca exige um `model_factory` reutilizável dentro de `Simulation` — quem escreve a closure só chama `Simulation::new()` + `set_model(...)`/`set_config_path(...)` de novo a cada vez, exatamente como faria uma segunda vez à mão; `Simulation::set_model` continua aceitando `FnOnce` sem problema, porque cada `Simulation` que sai daqui só é rodada (`spawn()`) uma única vez antes de ser descartada.
+
+O campo `current` do `Runtime` fica `None` só durante a janela interna de `reset()`/`request_shutdown()` entre "a antiga já foi `wait()`ada" e "a nova já foi `spawn()`ada" — nunca observável de fora: `current` continua trancado (mutex) o tempo todo dentro dessas chamadas, então ninguém mais consegue chamar `reset()`/`request_shutdown()` concorrentemente e ver esse `None`.
+
+## Interface
+
+- **`Runtime::new(build_simulation)`** — sobe a primeira `Simulation` (via `build_simulation()`), bloqueia até ela sinalizar pronta (`StateRegistry` resolvido, sensores/atuadores-espelho catalogados) e devolve um `Runtime` já operante — pronto pra subir um adapter em cima (`spawn_opcua_adapter`) ou ser consultado direto (`binding()`) em testes, sem nenhum adapter. Devolve `Arc<Self>`, não `Self`: todo mundo que precisa chamar `reset()`/`shutdown()`/`binding()` de fora (um Method do adaptador, `tep-plant/src/main.rs`) precisa da MESMA instância compartilhada, nunca uma cópia — `Runtime` não tem "duas fontes da verdade" sobre qual `PlantBinding` é o atual.
+- **`binding()`** — devolve um clone do `Arc<PlantBinding>` da planta ATUAL — o que um adaptador (`adapter/opcua.rs`) lê a cada tick/callback. Nunca guarde isto por muito tempo: cada chamada pega um clone fresco do que está publicado agora, pra sempre enxergar a instância mais recente depois de um `reset()`.
+- **`reset()`** — encerra a `Simulation` ATUAL (pede o stop cooperativo via `RuntimeControl::request_reset()` e BLOQUEIA até a Thread da planta antiga realmente morrer — `RunningSimulation::wait()`, join incluso), constrói e sobe uma nova do zero (`build_simulation()` de novo), espera ela sinalizar pronta, e só ENTÃO troca o `Arc<PlantBinding>` que `binding()` devolve — nunca as duas coisas ao mesmo tempo (ver "por que trocar tudo de uma vez, num Arc só" na `nota_runtime_supervisor.md`). É bloqueante: quem chama de um contexto que não pode travar (ex.: o callback de um Method OPC-UA, rodando num runtime tokio de thread única) precisa chamar isto de dentro do seu próprio `std::thread::spawn`, não direto no callback — `Runtime` não faz essa cortesia sozinho, porque nem todo chamador precisa dela (um teste chamando `reset()` direto QUER o bloqueio).
+- **`request_shutdown()`** — encerra a `Simulation` atual (mesmo mecanismo de `reset()`, sem reconstruir depois) e marca o `Runtime` como definitivamente parado — `wait_for_shutdown()` desbloqueia depois disso. Não derruba a thread do adaptador diretamente — mas, na prática, isso não sobra pendurado: a ÚLTIMA coisa que o `main()` do `tep-plant` faz é esperar o shutdown, então assim que isto desbloqueia, `main()` retorna e o PROCESSO INTEIRO acaba, levando junto a thread do adaptador (e qualquer outra) — verificado ao vivo: `control.shutdown` via OPC-UA realmente encerra o binário (exit code 0). O único cenário onde isso ficaria incompleto é `Runtime` embutido num processo maior que tem outros motivos pra continuar rodando depois de um `shutdown()` — aí sim a thread do adaptador vazaria, e derrubá-la de verdade exigiria passar um `tokio_util::CancellationToken` até `ServerBuilder::token(...)` (suportado pela própria `async-opcua-server`, só nunca conectado aqui) e cancelá-lo ali. Não implementado por não ser o caso de uso atual — `tep-plant` é sempre o processo inteiro.
+- **`wait_for_shutdown()`** — bloqueia até `request_shutdown()` ser chamado — a única espera de verdade do processo, que não tem mais nada de bloqueante pra fazer depois de subir o `Runtime` e, se aplicável, o adaptador.
+- **`Runtime::bootstrap()`** — bootstrap por convenção (issue #68), mesmo papel de `SpringApplication.run()`: localiza e carrega `application.toml` sozinho, lê a tabela `[monjolo]` de dentro dele e sobe o que o modo pedir. No modo simulação, monta a `Simulation` com o método numérico configurado e — se a feature `opcua` estiver ligada — já sobe o adaptador OPC-UA no endpoint configurado. No modo função, monta um `ModelFunction` com o que o `inventory` descobre e abre o servidor de função; pedir esse modo num binário compilado sem a feature `function` é `Err`. Quem chama não passa NENHUMA dessas coisas — não é código imperativo escolhendo estratégia/caminho/endpoint, é dado, lido de um arquivo por convenção. Também escreve `execution_order.txt` — a ordem de execução real da fase (A), recalculada a cada `bootstrap()`, ou seja, a cada vez que o binário é recompilado E rodado de novo (`inventory::submit!` é decidido em tempo de compilação, mas a lista só existe montada em memória a partir do primeiro `inventory::iter()` do processo). Não bloqueia o boot se a escrita falhar — é um artefato de diagnóstico, não uma dependência funcional da aplicação. O `main()` de uma aplicação real fica só: `Runtime::bootstrap().expect(...).run();`
+- **`Runtime::run()`** — bloqueia pelo resto da vida do processo, do jeito certo pra cada configuração de feature — quem chama nunca precisa de `#[cfg(feature = "opcua")]` pra saber a diferença. Com a feature ligada, espera de verdade `control.shutdown` (`wait_for_shutdown()`). Sem ela, não há nenhum jeito de pedir shutdown de fora — a planta continua rodando normalmente no fundo, então isto só estaciona a thread principal (`park()` em loop) pra sempre, em vez de bloquear numa `Condvar` que ninguém nunca vai notificar.
+- **`spawn_opcua_adapter(endpoint)`** (feature `opcua`) — sobe o adaptador OPC-UA numa thread própria, pelo tempo de vida inteiro do `Runtime` — spawnado UMA vez, nunca de novo por causa de um `reset()` (esse é exatamente o ponto: o adaptador sobrevive). Roda num runtime tokio `current_thread` (sem pool de worker threads — não há trabalho paralelo real a justificar um, ver `adapter/opcua.rs`).
+- **`Application`** — o que `Runtime::bootstrap()` devolve: a aplicação já decidida pela configuração (`Mode`), pronta pra `run()` — `main()` não precisa saber qual das duas subiu. A variante `Function` guarda o modelo junto do servidor porque `ModelFunction` é `Rc`-based (`!Send`): quem chama `run()` tem que ser a mesma thread que chamou `bootstrap()`, que é exatamente o que um `main()` faz.
+- **`Application::run()`** — bloqueia pelo resto da vida do processo: `Runtime::run()` no modo simulação, o laço do servidor no modo função.
+- **`BootstrapSettings::parse(path, mode_override, function_endpoint_override)`** — lê a configuração de `path`. Os dois últimos argumentos são o que veio do ambiente (`MONJOLO_MODE` e `MONJOLO_FUNCTION_ENDPOINT`) e ganham do arquivo. É separado da leitura do ambiente só pra dar pra testar a precedência sem mexer em variável de ambiente, que é compartilhada entre testes que rodam em paralelo. `BootstrapSettings`, seus campos e `Mode` são públicos por esse mesmo motivo: os testes ficam fora de `src/` e só enxergam a interface pública.
+
+## Testes
+
+`tests/runtime.rs` cobre a leitura da configuração (padrões, precedência do ambiente, valores inválidos) e o comportamento do `Runtime` com modelos de brinquedo: a primeira planta fica exposta, `reset()` troca a instância em vez de pausá-la, e uma escrita de atuador feita depois do reset chega na planta nova.

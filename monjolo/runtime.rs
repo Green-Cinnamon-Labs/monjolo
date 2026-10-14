@@ -1,69 +1,25 @@
 /* monjolo/runtime.rs */
 
-/** O supervisor persistente que faltava — issue #67, desenho completo em
-`spec-tennessee-eastman/docs/issue61_runtime_supervisor/nota_runtime_supervisor.md`. `Simulation`
-(`simulation.rs`) é o builder/runner de UMA física, do início até alguém pedir pra parar; `Runtime` é
-quem vive o processo inteiro, é dono do adaptador de rede (hoje só OPC-UA) pelo tempo de vida inteiro
-dele, e troca atomicamente pra qual `Simulation` o adaptador aponta a cada `reset()` — o adaptador,
-a conexão TCP de um cliente conectado, e a estrutura de nodes nunca caem.
-
-Analogia usada na nota: isto é o mesmo movimento que fechar e dar `refresh()` num `ApplicationContext`
-do Spring — o grafo de objetos inteiro (StateRegistry, Sensor/Actuator/Controller) é jogado fora e
-reconstruído do zero a cada reset, nunca remendado no lugar.
-*/
-
+/* Documentação em `docs/runtime.md`; testes em `tests/runtime.rs`. */
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::numerical_method::NumericalMethod;
 use crate::simulation::{PlantBinding, RunningSimulation, Simulation};
 
-/** Convenção fixa (issue #68) — `application.toml` sempre na raiz do projeto (diretório de trabalho
-no momento em que o binário roda), nunca um caminho passado por quem monta a aplicação. Mesmo papel
-de `application.properties`/`.yml` na raiz do classpath no Spring: a APLICAÇÃO não escolhe onde
-procurar, só o CONTEÚDO é dela.
-*/
 const CONFIG_PATH: &str = "application.toml";
-
-/** Onde `bootstrap()` escreve o artefato de diagnóstico de `describe_phase_a_execution_order()`
-(issue spec-tennessee-eastman#71) — mesma convenção de `CONFIG_PATH`: raiz do projeto, sempre esse
-nome, nunca configurável (não é um artefato que a aplicação personaliza, é sempre o mesmo debug).
-*/
 const EXECUTION_ORDER_PATH: &str = "execution_order.txt";
 
-/* Porta IANA padrão de OPC-UA. Host é `127.0.0.1`, não `0.0.0.0` — de propósito: async-opcua-server
-não distingue "endereço de bind" de "endereço anunciado" (`ServerInfo::base_endpoint()`, em
-async-opcua-server/src/info.rs, monta o EndpointUrl que o servidor devolve em GetEndpoints/
-FindServers a partir do MESMO `tcp_config.host` do bind). Com `0.0.0.0`, o servidor aceita conexão em
-qualquer interface, mas anuncia a si mesmo como "opc.tcp://0.0.0.0:...", um endereço que nenhum
-cliente consegue discar de verdade — quebra qualquer client que confie no EndpointUrl reportado pra
-reconectar (ex.: UaExpert), mesmo que a conexão inicial/manual funcione. Se um dia isso precisar ser
-alcançável de outra máquina na rede, precisa virar configurável (bind em 0.0.0.0, anunciar o IP real
-da máquina) — não dá pra ter os dois com essa constante sozinha hoje.
-*/
 #[cfg(feature = "opcua")]
 const DEFAULT_OPCUA_ENDPOINT: &str = "opc.tcp://127.0.0.1:4840/tep/server/";
-
-/* Onde o adaptador de função (`adapter/function.rs`) escuta quando `[monjolo.function].endpoint` não
-diz outra coisa. `127.0.0.1`: só a própria máquina alcança — pra servir de dentro de um container é
-preciso configurar `0.0.0.0:porta`.
-*/
 #[cfg(feature = "function")]
 const DEFAULT_FUNCTION_ENDPOINT: &str = "127.0.0.1:8091";
 
-/* Variáveis de ambiente que têm precedência sobre `application.toml` — pra mesma imagem (mesmo
-binário, mesmo arquivo) subir num modo ou no outro sem editar arquivo nenhum.
-*/
 const MODE_ENV: &str = "MONJOLO_MODE";
 #[cfg(feature = "function")]
 const FUNCTION_ENDPOINT_ENV: &str = "MONJOLO_FUNCTION_ENDPOINT";
 
-/** O que `bootstrap()` sobe (`[monjolo].mode` em `application.toml`, ou `MONJOLO_MODE`).
-`Simulation` é o de sempre: a Thread da planta integrando no tempo, com o adaptador OPC-UA se a
-feature estiver ligada. `Function` não integra nada: monta o modelo uma vez e o serve como função
-por HTTP (spec-tennessee-eastman#94) — sem Thread da planta e sem OPC-UA.
-*/
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Mode {
+pub enum Mode {
     #[default]
     Simulation,
     Function,
@@ -81,29 +37,17 @@ impl std::str::FromStr for Mode {
     }
 }
 
-/** Configurações de framework lidas de `[monjolo]` dentro de `application.toml` — deliberadamente
-separado de `Snapshot` (`snapshot.rs`), que só entende `f64` e ignora todo o resto. Mesmo arquivo,
-duas leituras independentes: `Snapshot` cuida da condição inicial física (`[state.*]`), isto aqui
-cuida de configuração de orquestração (`[monjolo]`) — a mesma separação que `[meta]` já demonstra
-(tabela não-numérica que `Snapshot` sempre ignorou, sem problema nenhum).
-*/
 #[derive(Debug)]
-struct BootstrapSettings {
-    mode: Mode,
-    numerical_method: NumericalMethod,
+pub struct BootstrapSettings {
+    pub mode: Mode,
+    pub numerical_method: NumericalMethod,
     #[cfg(feature = "opcua")]
-    opcua_endpoint: String,
+    pub opcua_endpoint: String,
     #[cfg(feature = "function")]
-    function_endpoint: String,
+    pub function_endpoint: String,
 }
 
 impl BootstrapSettings {
-    /** Arquivo ausente não é erro fatal aqui — cai pros defaults de framework, mesmo espírito de
-    `application.properties` ser opcional no Spring (a app roda com default se ele não existir).
-    Arquivo PRESENTE mas malformado, ou com uma chave reconhecida mas de valor inválido (ex.:
-    `numerical_method = "euler"`, que não existe), É erro fatal — a diferença entre "não configurado"
-    e "configurado errado" importa.
-    */
     fn load(path: &str) -> Result<Self, String> {
         let mode_override = std::env::var(MODE_ENV).ok();
         #[cfg(feature = "function")]
@@ -113,11 +57,7 @@ impl BootstrapSettings {
         Self::parse(path, mode_override.as_deref(), endpoint_override.as_deref())
     }
 
-    /* Separado de `load()` só pra dar pra testar a precedência sem mexer em variável de ambiente
-    (compartilhada entre testes que rodam em paralelo): `mode_override`/`function_endpoint_override`
-    são o que `load()` leu do ambiente.
-    */
-    fn parse(
+    pub fn parse(
         path: &str,
         mode_override: Option<&str>,
         function_endpoint_override: Option<&str>,
@@ -177,38 +117,17 @@ impl BootstrapSettings {
     }
 }
 
-/** Fábrica de uma `Simulation` nova — chamada uma vez no boot do `Runtime` e de novo a cada
-`reset()`. Precisa ser `Fn`, não `FnOnce`: cada chamada tem que produzir uma `Simulation` igualmente
-válida, sem depender de nada "gasto" na primeira vez. Na prática isso nunca exige um `model_factory`
-reutilizável dentro de `Simulation` — quem escreve esta closure só chama `Simulation::new()` +
-`set_model(...)`/`set_config_path(...)` de novo a cada vez, exatamente como faria uma segunda vez à
-mão; `Simulation::set_model` continua aceitando `FnOnce` sem problema, porque cada `Simulation` que
-sai daqui só é rodada (`spawn()`) uma única vez antes de ser descartada.
-*/
 type SimulationFactory = dyn Fn() -> Simulation + Send + Sync;
 
 pub struct Runtime {
     build_simulation: Box<SimulationFactory>,
     binding: RwLock<Arc<PlantBinding>>,
-    /** `None` só durante a janela interna de `reset()`/`request_shutdown()` entre "a antiga já foi
-    `wait()`ada" e "a nova já foi `spawn()`ada" — nunca observável de fora: `current` continua
-    trancado (mutex) o tempo todo dentro dessas chamadas, então ninguém mais consegue chamar
-    `reset()`/`request_shutdown()` concorrentemente e ver este `None`.
-    */
+    /* `None` só dentro de `reset()`/`request_shutdown()`, com o mutex trancado. */
     current: Mutex<Option<RunningSimulation>>,
     shutdown: (Mutex<bool>, Condvar),
 }
 
 impl Runtime {
-    /** Sobe a primeira `Simulation` (via `build_simulation()`), bloqueia até ela sinalizar pronta
-    (`StateRegistry` resolvido, sensores/atuadores-espelho catalogados) e devolve um `Runtime` já
-    operante — pronto pra subir um adapter em cima (`spawn_opcua_adapter`) ou ser consultado direto
-    (`binding()`) em testes, sem nenhum adapter.
-
-    `Arc<Self>`, não `Self`: todo mundo que precisa chamar `reset()`/`shutdown()`/`binding()` de fora
-    (um Method do adaptador, `tep-plant/src/main.rs`) precisa da MESMA instância compartilhada, nunca
-    uma cópia — `Runtime` não tem "duas fontes da verdade" sobre qual `PlantBinding` é o atual.
-    */
     pub fn new(
         build_simulation: impl Fn() -> Simulation + Send + Sync + 'static,
     ) -> Result<Arc<Self>, String> {
@@ -226,11 +145,6 @@ impl Runtime {
         }))
     }
 
-    /** Devolve um clone do `Arc<PlantBinding>` da planta ATUAL — o que um adaptador (`adapter/
-    opcua.rs`) lê a cada tick/callback. Nunca guarde isto por muito tempo: cada chamada pega um
-    clone fresco do que está publicado agora, pra sempre enxergar a instância mais recente depois
-    de um `reset()`.
-    */
     pub fn binding(&self) -> Arc<PlantBinding> {
         self.binding
             .read()
@@ -238,17 +152,6 @@ impl Runtime {
             .clone()
     }
 
-    /** Encerra a `Simulation` ATUAL (pede o stop cooperativo via `RuntimeControl::request_reset()`
-    e BLOQUEIA até a Thread da planta antiga realmente morrer — `RunningSimulation::wait()`, join
-    incluso), constrói e sobe uma nova do zero (`build_simulation()` de novo), espera ela sinalizar
-    pronta, e só ENTÃO troca o `Arc<PlantBinding>` que `binding()` devolve — nunca as duas coisas ao
-    mesmo tempo (ver "por que trocar tudo de uma vez, num Arc só" na nota_runtime_supervisor.md).
-
-    Bloqueante: quem chama de um contexto que não pode travar (ex.: o callback de um Method OPC-UA,
-    rodando num runtime tokio de thread única) precisa chamar isto de dentro do seu próprio
-    `std::thread::spawn`, não direto no callback — `Runtime` não faz essa cortesia sozinho, porque
-    nem todo chamador precisa dela (um teste chamando `reset()` direto QUER o bloqueio).
-    */
     pub fn reset(&self) -> Result<(), String> {
         let mut current = self.current.lock().expect("Runtime: Mutex<CurrentPlant> envenenado");
 
@@ -272,20 +175,6 @@ impl Runtime {
         Ok(())
     }
 
-    /** Encerra a `Simulation` atual (mesmo mecanismo de `reset()`, sem reconstruir depois) e marca
-    o `Runtime` como definitivamente parado — `wait_for_shutdown()` desbloqueia depois disso.
-
-    Não derruba a thread do adaptador diretamente — mas, na prática, isso não sobra pendurado: a
-    ÚLTIMA linha de `tep-plant/src/main.rs` é `runtime.wait_for_shutdown()`, então assim que isto
-    desbloqueia, `main()` retorna e o PROCESSO INTEIRO acaba, levando junto a thread do adaptador
-    (e qualquer outra) — verificado ao vivo: `control.shutdown` via OPC-UA realmente encerra o
-    binário (exit code 0). O único cenário onde isso ficaria incompleto é `Runtime` embutido num
-    processo maior que tem outros motivos pra continuar rodando depois de um `shutdown()` — aí sim
-    a thread do adaptador vazaria, e derrubá-la de verdade exigiria passar um
-    `tokio_util::CancellationToken` até `ServerBuilder::token(...)` (suportado pela própria
-    `async-opcua-server`, só nunca conectado aqui) e cancelá-lo aqui. Não implementado nesta leva
-    por não ser o caso de uso atual — `tep-plant` é sempre o processo inteiro.
-    */
     pub fn request_shutdown(&self) {
         let mut current = self.current.lock().expect("Runtime: Mutex<CurrentPlant> envenenado");
         if let Some(running) = current.take() {
@@ -301,10 +190,6 @@ impl Runtime {
         condvar.notify_all();
     }
 
-    /** Bloqueia até `request_shutdown()` ser chamado — o que `tep-plant/src/main.rs` usa como sua
-    única espera de verdade (o processo não tem mais nada de bloqueante pra fazer depois de subir o
-    `Runtime` e, se aplicável, o adaptador).
-    */
     pub fn wait_for_shutdown(&self) {
         let (done_mutex, condvar) = &self.shutdown;
         let mut done = done_mutex.lock().expect("Runtime: Mutex<bool> de shutdown envenenado");
@@ -313,23 +198,6 @@ impl Runtime {
         }
     }
 
-    /** Bootstrap por convenção (issue #68) — mesmo papel de `SpringApplication.run()`: localiza e
-    carrega `application.toml` sozinho (`CONFIG_PATH`, sempre a raiz do projeto, nunca um caminho
-    que a aplicação escolhe), lê `[monjolo].numerical_method` de dentro dele (default `RK4` se
-    ausente), monta a `Simulation` com isso, e — se a feature `opcua` estiver ligada — já sobe o
-    adaptador OPC-UA no endpoint de `[monjolo.opcua].endpoint` (default o IANA padrão se ausente).
-    Quem chama isto não passa NENHUMA dessas três coisas — não é código imperativo escolhendo
-    estratégia/caminho/endpoint, é dado, lido de um arquivo por convenção.
-
-    Também escreve `EXECUTION_ORDER_PATH` (issue spec-tennessee-eastman#71) — a ordem de execução
-    real da fase (A), recalculada a cada `bootstrap()`, ou seja, a cada vez que o binário é
-    recompilado E rodado de novo (`inventory::submit!` é decidido em tempo de compilação, mas a
-    lista só existe montada em memória a partir do primeiro `inventory::iter()` deste processo).
-    Não bloqueia o boot se a escrita falhar — é um artefato de diagnóstico, não uma dependência
-    funcional da aplicação.
-
-    `main()` de uma aplicação real fica só: `Runtime::bootstrap().expect(...).run();`
-    */
     pub fn bootstrap() -> Result<Application, String> {
         if let Err(err) = std::fs::write(EXECUTION_ORDER_PATH, crate::component::describe_phase_a_execution_order()) {
             eprintln!("[bootstrap] não consegui escrever {EXECUTION_ORDER_PATH}: {err}");
@@ -373,13 +241,6 @@ impl Runtime {
         Ok(Application::Simulation(runtime))
     }
 
-    /** Bloqueia pelo resto da vida do processo, do jeito certo pra cada configuração de feature —
-    quem chama (`main()`) nunca precisa de `#[cfg(feature = "opcua")]` pra saber a diferença. Com a
-    feature ligada, espera de verdade `control.shutdown` (`wait_for_shutdown()`). Sem ela, não há
-    nenhum jeito de pedir shutdown de fora — a planta continua rodando normalmente no fundo, então
-    isto só estaciona a thread principal (`park()` em loop) pra sempre, em vez de bloquear numa
-    `Condvar` que ninguém nunca vai notificar.
-    */
     pub fn run(&self) {
         #[cfg(feature = "opcua")]
         self.wait_for_shutdown();
@@ -390,11 +251,6 @@ impl Runtime {
     }
 }
 
-/** O que `Runtime::bootstrap()` devolve: a aplicação já decidida pela configuração (`Mode`), pronta
-pra `run()` — `main()` não precisa saber qual das duas subiu. `Function` guarda o modelo junto do
-servidor porque `ModelFunction` é `Rc`-based (`!Send`): quem chama `run()` tem que ser a mesma thread
-que chamou `bootstrap()`, que é exatamente o que um `main()` faz.
-*/
 pub enum Application {
     Simulation(Arc<Runtime>),
     #[cfg(feature = "function")]
@@ -405,9 +261,6 @@ pub enum Application {
 }
 
 impl Application {
-    /** Bloqueia pelo resto da vida do processo — `Runtime::run()` no modo simulação, o laço do
-    servidor no modo função.
-    */
     pub fn run(&self) {
         match self {
             Application::Simulation(runtime) => runtime.run(),
@@ -417,11 +270,6 @@ impl Application {
     }
 }
 
-/** Sobe o adaptador OPC-UA numa thread própria, pelo tempo de vida inteiro do `Runtime` — spawnado
-UMA vez, nunca de novo por causa de um `reset()` (esse é exatamente o ponto: o adaptador sobrevive).
-Roda num runtime tokio `current_thread` (sem pool de worker threads — não há trabalho paralelo real
-a justificar um, ver `adapter/opcua.rs`).
-*/
 #[cfg(feature = "opcua")]
 impl Runtime {
     pub fn spawn_opcua_adapter(self: &Arc<Self>, endpoint: impl Into<String>) {
@@ -441,352 +289,5 @@ impl Runtime {
                 }
             })
             .expect("Runtime: falha ao criar a thread do adapter");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dynamic_model::{Composite, CompositeDynamicModel, DynamicModel};
-    use crate::sensor::model::{Ideal, Sensor as ConcreteSensor};
-    use crate::state_registry::{Proxy, StateRegistry};
-    use std::time::Duration;
-
-    /* Escreve `content` num arquivo temporário com nome único (evita colisão entre testes
-    rodando em paralelo, já que `cargo test` não serializa por padrão), roda `body` com o
-    caminho, e sempre limpa o arquivo depois — mesmo se `body` panicar (`Drop`, não um
-    `finally` manual).
-    */
-    struct TempTomlFile {
-        path: std::path::PathBuf,
-    }
-
-    impl TempTomlFile {
-        fn new(name: &str, content: &str) -> Self {
-            let path = std::env::temp_dir().join(name);
-            std::fs::write(&path, content).expect("falha ao escrever TOML temporário de teste");
-            Self { path }
-        }
-
-        fn path_str(&self) -> &str {
-            self.path.to_str().expect("caminho temporário deveria ser UTF-8 válido")
-        }
-    }
-
-    impl Drop for TempTomlFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    #[test]
-    fn bootstrap_settings_default_when_file_is_absent() {
-        let path = std::env::temp_dir().join("monjolo_bootstrap_test_does_not_exist.toml");
-        let _ = std::fs::remove_file(&path); // garante que não existe de uma rodada anterior
-        let settings = BootstrapSettings::load(path.to_str().unwrap())
-            .expect("arquivo ausente não deveria ser erro fatal");
-        assert!(matches!(settings.numerical_method, NumericalMethod::RK4));
-    }
-
-    #[test]
-    fn bootstrap_settings_reads_numerical_method_from_monjolo_table() {
-        let file = TempTomlFile::new(
-            "monjolo_bootstrap_test_numerical_method.toml",
-            "[monjolo]\nnumerical_method = \"RK4\"\n",
-        );
-        let settings =
-            BootstrapSettings::load(file.path_str()).expect("TOML válido não deveria falhar");
-        assert!(matches!(settings.numerical_method, NumericalMethod::RK4));
-    }
-
-    #[test]
-    fn bootstrap_settings_mode_defaults_to_simulation_and_reads_function_from_monjolo_table() {
-        let absent = TempTomlFile::new("monjolo_bootstrap_test_mode_absent.toml", "[monjolo]\nnumerical_method = \"rk4\"\n");
-        let settings = BootstrapSettings::parse(absent.path_str(), None, None).expect("TOML válido");
-        assert_eq!(settings.mode, Mode::Simulation);
-
-        let function = TempTomlFile::new("monjolo_bootstrap_test_mode_function.toml", "[monjolo]\nmode = \"function\"\n");
-        let settings = BootstrapSettings::parse(function.path_str(), None, None).expect("TOML válido");
-        assert_eq!(settings.mode, Mode::Function);
-    }
-
-    /* O que veio do ambiente (`MONJOLO_MODE`) ganha do arquivo — nos dois sentidos. */
-    #[test]
-    fn bootstrap_settings_mode_override_wins_over_the_file() {
-        let file = TempTomlFile::new("monjolo_bootstrap_test_mode_override.toml", "[monjolo]\nmode = \"simulation\"\n");
-
-        let settings = BootstrapSettings::parse(file.path_str(), Some("function"), None).expect("TOML válido");
-        assert_eq!(settings.mode, Mode::Function);
-
-        let file = TempTomlFile::new("monjolo_bootstrap_test_mode_override_back.toml", "[monjolo]\nmode = \"function\"\n");
-        let settings = BootstrapSettings::parse(file.path_str(), Some("Simulation"), None).expect("TOML válido");
-        assert_eq!(settings.mode, Mode::Simulation);
-    }
-
-    #[test]
-    fn bootstrap_settings_errors_on_unknown_mode() {
-        let file = TempTomlFile::new("monjolo_bootstrap_test_bad_mode.toml", "[monjolo]\nmode = \"batch\"\n");
-        let err = BootstrapSettings::parse(file.path_str(), None, None)
-            .expect_err("modo desconhecido deveria ser erro fatal, não um default silencioso");
-        assert!(err.contains("batch"), "mensagem de erro deveria citar o valor inválido: {err}");
-    }
-
-    #[cfg(feature = "function")]
-    #[test]
-    fn bootstrap_settings_function_endpoint_comes_from_override_then_file_then_default() {
-        let file = TempTomlFile::new(
-            "monjolo_bootstrap_test_function_endpoint.toml",
-            "[monjolo.function]\nendpoint = \"0.0.0.0:9000\"\n",
-        );
-        let settings = BootstrapSettings::parse(file.path_str(), None, Some("127.0.0.1:7000")).expect("TOML válido");
-        assert_eq!(settings.function_endpoint, "127.0.0.1:7000");
-
-        let settings = BootstrapSettings::parse(file.path_str(), None, None).expect("TOML válido");
-        assert_eq!(settings.function_endpoint, "0.0.0.0:9000");
-
-        let absent = TempTomlFile::new("monjolo_bootstrap_test_function_endpoint_default.toml", "[monjolo]\n");
-        let settings = BootstrapSettings::parse(absent.path_str(), None, None).expect("TOML válido");
-        assert_eq!(settings.function_endpoint, DEFAULT_FUNCTION_ENDPOINT);
-    }
-
-    #[test]
-    fn bootstrap_settings_errors_on_unknown_numerical_method() {
-        let file = TempTomlFile::new(
-            "monjolo_bootstrap_test_bad_numerical_method.toml",
-            "[monjolo]\nnumerical_method = \"euler\"\n",
-        );
-        let err = BootstrapSettings::load(file.path_str())
-            .expect_err("método numérico desconhecido deveria ser erro fatal, não um default silencioso");
-        assert!(err.contains("euler"), "mensagem de erro deveria citar o valor inválido: {err}");
-    }
-
-    #[test]
-    fn bootstrap_settings_ignores_unrelated_tables_like_state_and_meta() {
-        /* Mesmo arquivo real que `Simulation`/`Snapshot` consomem pras chaves físicas
-        (`[state.*]`) e `[meta]` — prova que ler `[monjolo]` não colide com, nem exige nada de,
-        o resto do arquivo que `application.toml` de verdade sempre teve.
-        */
-        let file = TempTomlFile::new(
-            "monjolo_bootstrap_test_mixed_file.toml",
-            "[meta]\ndescription = \"não é numérico, Snapshot ignora\"\n\n\
-             [state.reactor]\nenergy = 3.25\n\n\
-             [monjolo]\nnumerical_method = \"rk4\"\n",
-        );
-        let settings = BootstrapSettings::load(file.path_str())
-            .expect("tabelas [meta]/[state.*] não deveriam atrapalhar a leitura de [monjolo]");
-        assert!(matches!(settings.numerical_method, NumericalMethod::RK4));
-    }
-
-    #[cfg(feature = "opcua")]
-    #[test]
-    fn bootstrap_settings_reads_opcua_endpoint_override_and_falls_back_to_default() {
-        let overridden = TempTomlFile::new(
-            "monjolo_bootstrap_test_opcua_endpoint.toml",
-            "[monjolo.opcua]\nendpoint = \"opc.tcp://0.0.0.0:9999/custom/\"\n",
-        );
-        let settings = BootstrapSettings::load(overridden.path_str())
-            .expect("TOML válido não deveria falhar");
-        assert_eq!(settings.opcua_endpoint, "opc.tcp://0.0.0.0:9999/custom/");
-
-        let absent_table = TempTomlFile::new(
-            "monjolo_bootstrap_test_opcua_endpoint_default.toml",
-            "[monjolo]\nnumerical_method = \"rk4\"\n",
-        );
-        let settings = BootstrapSettings::load(absent_table.path_str())
-            .expect("TOML válido não deveria falhar");
-        assert_eq!(settings.opcua_endpoint, DEFAULT_OPCUA_ENDPOINT);
-    }
-
-    /* Semeia "test.frozen.value" em 42.0 e nunca mais toca nele — sem `state_keys()` (fica no
-    default vazio de `DynamicModel`), então RK4 nunca integra essa chave e nada nunca chama
-    `.set()` nela de novo. Só serve pra provar que um valor semeado sobrevive até virar `CurrentState`
-    de verdade (depois do 1º `commit()`) e fica exatamente ali — sem a complicação de uma física que
-    muda o valor a cada tick, o que tornaria qualquer asserção de igualdade sensível a quantos ticks
-    já rodaram no momento exato da leitura.
-    */
-    struct FrozenModel {
-        value: Proxy,
-    }
-
-    impl FrozenModel {
-        fn new(registry: &mut StateRegistry) -> Self {
-            let (offered, _) = registry.subscribe(&["test.frozen.value"], &[]);
-            offered[0].set(42.0);
-            ConcreteSensor::new(registry, "test.frozen.value", Box::new(Ideal));
-            Self { value: offered[0].clone() }
-        }
-    }
-
-    impl DynamicModel for FrozenModel {
-        fn evaluate(&self) {
-            let _ = &self.value; // nada a fazer — o valor não muda de propósito
-        }
-    }
-
-    /* dv/dt = -v, nasce em 100.0 — mesma física de `simulation.rs::tests::DecayModel`, só que
-    também publica um `Sensor` de verdade ("test.runtime.value") pra que o teste consiga ler o
-    valor de FORA, através de `Runtime::binding().sensors` — o único jeito que um consumidor
-    externo (um adapter, ou este teste) tem de ver o que está acontecendo dentro da Thread da
-    planta, sem acesso direto ao `Proxy` (que é `!Send`, preso àquela thread).
-    */
-    struct DecayModel {
-        value: Proxy,
-        derivative: Proxy,
-    }
-
-    impl DecayModel {
-        fn new(registry: &mut StateRegistry) -> Self {
-            let (offered, _) = registry
-                .subscribe(&["test.runtime.value", "test.runtime.value.derivative"], &[]);
-            offered[0].set(100.0);
-            ConcreteSensor::new(registry, "test.runtime.value", Box::new(Ideal));
-            Self {
-                value: offered[0].clone(),
-                derivative: offered[1].clone(),
-            }
-        }
-    }
-
-    impl DynamicModel for DecayModel {
-        fn evaluate(&self) {
-            let value = self.value.get();
-            self.derivative.set(-value);
-        }
-
-        fn state_keys(&self) -> Vec<String> {
-            vec!["test.runtime.value".to_string()]
-        }
-    }
-
-    /* `fn() -> Simulation` puro (sem captura nenhuma) — satisfaz `Fn + Send + Sync + 'static` de
-    graça, exatamente o formato que `Runtime` precisa poder chamar de novo a cada `reset()`.
-    */
-    fn build_test_simulation() -> Simulation {
-        let mut simulation = Simulation::new();
-        simulation.set_tick_interval(Duration::from_millis(5));
-        simulation.set_dt_hours(0.1);
-        simulation.set_model(|registry, _config| DecayModel::new(registry));
-        simulation
-    }
-
-    fn build_frozen_simulation() -> Simulation {
-        let mut simulation = Simulation::new();
-        simulation.set_tick_interval(Duration::from_millis(5));
-        simulation.set_model(|registry, _config| FrozenModel::new(registry));
-        simulation
-    }
-
-    #[test]
-    fn new_builds_and_exposes_the_first_plant() {
-        let runtime =
-            Runtime::new(build_frozen_simulation).expect("Runtime::new deveria funcionar");
-        let binding = runtime.binding();
-        assert!(
-            binding.sensors.contains_key("test.frozen.value"),
-            "sensor publicado pelo FrozenModel deveria aparecer no PlantBinding inicial"
-        );
-
-        /* `ready` (que `Runtime::new()` espera) dispara logo depois do resolve() geral — ANTES do
-        primeiro tick da Thread da planta ter rodado `commit()`. `Sensor::read()` reflete
-        `CurrentState`, que só existe depois do primeiro commit (o valor semeado em `offered[0].set
-        (42.0)` dentro de `FrozenModel::new()` só escreveu em `EvaluationState` até então) — por
-        isso a pequena espera aqui, não porque `Runtime`/`PlantBinding` tenham algo assíncrono.
-        `FrozenModel` não declara `state_keys()`, então o valor não muda depois disso — nenhuma
-        corrida com "quantos ticks já rodaram".
-        */
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(binding.sensors["test.frozen.value"].read(), 42.0);
-    }
-
-    #[test]
-    fn reset_replaces_the_plant_instance_instead_of_just_pausing_it() {
-        let runtime = Runtime::new(build_test_simulation).expect("Runtime::new deveria funcionar");
-
-        // Deixa a física decair de verdade por um tempo.
-        std::thread::sleep(Duration::from_millis(100));
-        let decayed = runtime.binding().sensors["test.runtime.value"].read();
-        assert!(
-            decayed < 90.0,
-            "esperava decaimento perceptível de 100.0 antes do reset, ficou em {decayed}"
-        );
-
-        runtime.reset().expect("reset() deveria funcionar");
-
-        /* `ready` (que `reset()` espera antes de trocar o binding) dispara antes do 1º commit da
-        planta NOVA — a mesma corrida do teste anterior. Uma espera mínima garante pelo menos um
-        commit; como a física É decaimento, esse único tick já tira o valor de exatos 100.0 (RK4,
-        dt=0.1h: ≈90.5 depois de 1 tick) — por isso o limiar abaixo (75.0) tem folga pra alguns
-        ticks de jitter, mas ainda separa claramente de "continuou decaindo de onde a antiga
-        parou" (que já estava < 90 ANTES do reset, e só cairia mais numa janela de espera igual).
-        */
-        std::thread::sleep(Duration::from_millis(10));
-
-        /* Se `reset()` só tivesse pausado/mantido a instância antiga, o valor continuaria baixo
-        (ou congelado onde estava). Uma planta genuinamente NOVA reseta pro valor semeado (100.0)
-        de novo — é essa diferença que prova "substituição de instância", não "reconstrução
-        cosmética" nem "a mesma planta, só re-`resolve()`'d".
-        */
-        let fresh = runtime.binding().sensors["test.runtime.value"].read();
-        assert!(
-            fresh > 75.0,
-            "esperava a planta NOVA reiniciada perto de 100.0 (menos 1-2 ticks de decaimento) \
-            logo após reset(), ficou em {fresh} (se ficou baixo/perto de {decayed}, o reset não \
-            substituiu a instância de verdade)"
-        );
-    }
-
-    #[test]
-    fn binding_after_reset_routes_actuator_writes_to_the_new_plant_thread() {
-        /* dynamics = |command, _state| command: a derivada É o comando, então RK4 integra a uma
-        taxa constante e previsível — depois de N ticks com dt_hours=1.0, a posição avançou N*42.0
-        a partir do write. Escolhido só pra este teste ser determinístico sem depender de constante
-        de tempo/convergência nenhuma — o objeto sob teste é o ROTEAMENTO da escrita (o `Sender` do
-        `PlantBinding` chegar na Thread da planta NOVA, não numa antiga já morta), não a física.
-        */
-        use crate::actuator::model::Actuator as ConcreteActuator;
-
-        fn build_actuator_simulation() -> Simulation {
-            let mut simulation = Simulation::new();
-            simulation.set_tick_interval(Duration::from_millis(5));
-            simulation.set_dt_hours(1.0);
-            simulation.set_model(|registry, _config| {
-                let actuator = ConcreteActuator::new(
-                    registry,
-                    "test.runtime.actuator",
-                    |command, _state| command,
-                );
-                let mut root = Composite::new().named("test-actuator-root");
-                root.add_dynamic(Box::new(actuator));
-                root
-            });
-            simulation
-        }
-
-        let runtime =
-            Runtime::new(build_actuator_simulation).expect("Runtime::new deveria funcionar");
-        std::thread::sleep(Duration::from_millis(20));
-
-        runtime.reset().expect("reset() deveria funcionar");
-
-        let binding = runtime.binding();
-        binding
-            .commands
-            .send(("test.runtime.actuator".to_string(), 42.0))
-            .expect("o Sender do PlantBinding pós-reset deveria ter um receptor vivo do outro lado");
-
-        // Espera tempo suficiente pra pelo menos alguns ticks rodarem com o comando já aplicado.
-        std::thread::sleep(Duration::from_millis(30));
-
-        let shadow = binding
-            .actuators
-            .get("test.runtime.actuator")
-            .expect("atuador deveria estar catalogado no PlantBinding pós-reset");
-        assert!(
-            shadow.read() > 10.0,
-            "escrita enviada DEPOIS do reset deveria ter sido drenada e integrada pela Thread da \
-            planta NOVA (posição ficou em {}); se ficou em 0.0, o comando foi mandado pra um \
-            Sender cujo receptor já não existe mais (a Thread da planta antiga)",
-            shadow.read(),
-        );
     }
 }
